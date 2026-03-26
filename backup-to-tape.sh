@@ -34,7 +34,7 @@ ensure_low_priority() {
     fi
   fi
 }
- 
+
 # Where Splunk stores its index data on THIS indexer
 SPLUNK_DB="${SPLUNK_DB:-/archdisk/splunk_db}"
  
@@ -105,11 +105,15 @@ SLOT_LAST="${SLOT_LAST:-40}"
 
 # Media filtering: refuse cleaning cartridges and optionally restrict data tags.
 DATA_TAPE_TAG_REGEX="${DATA_TAPE_TAG_REGEX:-}"
+
+# Default LTFS integration for automatic mount/unmount during tape rotation.
+LTFS_BIN="${LTFS_BIN:-ltfs}"
+LTFS_DEVNAME="${LTFS_DEVNAME:-/dev/nst0}"
  
 # Optional: define explicit mount/unmount commands if needed (StoreOpen/LTFS)
-# If BACKUP_ROOT is already mounted by other means, leave these as ":" no-ops.
-MOUNT_CMD="${MOUNT_CMD:-:}"            # e.g. "mount /tape_mount"
-UMOUNT_CMD="${UMOUNT_CMD:-:}"          # e.g. "umount /tape_mount"
+# If unset, the script defaults to LTFS mount and standard umount.
+MOUNT_CMD="${MOUNT_CMD:-}"
+UMOUNT_CMD="${UMOUNT_CMD:-}"
  
 # Catalog mapping bucket -> tape VolumeTag
 CATALOG_FILE="${CATALOG_FILE:-$STATE_DIR/catalog.csv}"
@@ -126,6 +130,16 @@ log()       { echo "[$(timestamp)] $*" | tee -a "$LOG_FILE" >&2; }
 err()       { echo "[$(timestamp)] [ERROR] $*" | tee -a "$LOG_FILE" >&2; }
  
 have_cmd()  { command -v "$1" >/dev/null 2>&1; }
+
+have_path_cmd() {
+  local cmd="$1"
+
+  if [[ "$cmd" == */* ]]; then
+    [[ -x "$cmd" ]]
+  else
+    have_cmd "$cmd"
+  fi
+}
  
 human_bytes() {
   if have_cmd numfmt; then numfmt --to=iec "$1"; else echo "$1"; fi
@@ -244,7 +258,34 @@ require_cmds() {
     for c in bash find rsync flock date mkdir mv awk mountpoint df mtx stat realpath; do
     have_cmd "$c" || { err "Missing required command: $c"; missing=1; }
   done
+
+  if [[ -z "$MOUNT_CMD" ]] && ! have_path_cmd "$LTFS_BIN"; then
+    err "Missing required LTFS mount command: $LTFS_BIN"
+    missing=1
+  fi
+
+  if [[ -z "$UMOUNT_CMD" ]] && ! have_cmd umount; then
+    err "Missing required command: umount"
+    missing=1
+  fi
+
   (( missing == 0 )) || { err "Install required commands and re-run."; exit 1; }
+}
+
+mount_tape_filesystem() {
+  if [[ -n "$MOUNT_CMD" ]]; then
+    eval "$MOUNT_CMD"
+  else
+    "$LTFS_BIN" "$BACKUP_ROOT" -o "devname=$LTFS_DEVNAME"
+  fi
+}
+
+unmount_tape_filesystem() {
+  if [[ -n "$UMOUNT_CMD" ]]; then
+    eval "$UMOUNT_CMD"
+  else
+    umount "$BACKUP_ROOT"
+  fi
 }
  
 tape_status() {
@@ -385,11 +426,11 @@ ensure_tape_ready() {
     local ntag="${next##*:}"
     load_tape_from_slot "$slot"
     # mount if needed
-    eval "$MOUNT_CMD"
+    mount_tape_filesystem
     ensure_mount
     tag="$ntag"
   elif [[ "${SKIP_MOUNT_CHECK:-0}" != "1" ]] && ! mountpoint -q "$BACKUP_ROOT"; then
-    eval "$MOUNT_CMD"
+    mount_tape_filesystem
   fi
   # If a tape is already loaded, still verify the mountpoint is valid
   ensure_mount
@@ -422,7 +463,7 @@ rotate_tape() {
   echo "# EndOfTape VolumeTag=$curtag Time=$(timestamp) Run=$RUN_ID" >> "$TAPE_MANIFEST_ON_TAPE" || true
   cp -f "$TAPE_MANIFEST_ON_TAPE" "$TAPE_MANIFEST_DIR/$(basename "$TAPE_MANIFEST_ON_TAPE")" || true
  
-  eval "$UMOUNT_CMD" || true
+  unmount_tape_filesystem || true
  
   # If we know the original slot, unload back to it; otherwise try the next empty slot strategy (not shown)
   if [[ -n "$curslot" ]]; then
@@ -441,7 +482,7 @@ rotate_tape() {
   local ntag="${next##*:}"
  
   load_tape_from_slot "$slot"
-  eval "$MOUNT_CMD"
+  mount_tape_filesystem
   ensure_mount
  
   # Start a new manifest on the new tape (new RUN_ID optional; keeping same RUN_ID is fine)

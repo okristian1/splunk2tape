@@ -1,14 +1,14 @@
 # Copilot instructions for splunk_tape_backup
 
 ## Project overview (single-script tool)
-- Primary workflow lives in [backup-to-tape.sh](backup-to-tape.sh): it copies Splunk cold buckets from `$SPLUNK_DB/<index>/colddb` to a tape-mounted filesystem at `$BACKUP_ROOT/<index>`.
+- Primary workflow lives in [backup-to-tape.sh](../backup-to-tape.sh): it copies Splunk cold buckets from `$SPLUNK_DB/<index>/colddb` to a tape-mounted filesystem at `$BACKUP_ROOT/<index>`.
 - Data flow: bucket dir → rsync to `$BACKUP_ROOT/<index>/.tmp/<bucket>.partial-*` → size verify → atomic `mv` into final bucket dir.
 - Idempotency & resume: `$STATE_DIR/buckets_done.log` (ledger) prevents re-copy; per-run manifests are written on tape and mirrored to `$STATE_DIR/tape_manifests`.
 - Tape integration targets an HPE MSL3040 library using `mtx` for load/unload; drive/slot ranges are configured via `MTX_DEV`, `TAPE_DRIVE`, `SLOT_FIRST`, `SLOT_LAST`.
 
 ## Key operational knobs (env vars)
-- `SPLUNK_DB` and `BACKUP_ROOT` control source and tape mount paths.
-- `MOUNT_CMD` / `UMOUNT_CMD` are used to mount the tape filesystem (e.g., LTFS). Defaults are no-ops; the script expects `$BACKUP_ROOT` to be a mountpoint.
+- `SPLUNK_DB` defaults to `/archdisk/splunk_db`; `BACKUP_ROOT` controls the tape mount path.
+- `MOUNT_CMD` / `UMOUNT_CMD` override tape filesystem mount handling. By default the script mounts with `ltfs` using `LTFS_DEVNAME` and unmounts with `umount`, so tape rotation works without extra exports in common LTFS setups.
 - `VERIFY_METHOD=size|none` controls integrity checks (size compares total regular-file bytes via `stat`).
 - `MIN_FREE_BYTES` and `SOFT_LIMIT_BYTES` control tape capacity behavior; soft limit forces serial mode.
 - `PARALLELISM` defaults to 1 because tape is sequential; higher values are only sensible for VTL backends.
@@ -23,11 +23,12 @@
 ## Conventions & patterns
 - Tape rotation is automatic when free space (`df`) is below `bucket_bytes + MIN_FREE_BYTES`; the current tape is marked full in `$STATE_DIR/tapes_full.list`.
 - Buckets are selected from `db_*` and/or `rb_*` based on `INCLUDE_DB`/`INCLUDE_RB` flags.
+- Only `colddb` buckets are considered; sibling `frozendb` or other database paths are ignored.
 - The script uses `flock` on the ledger and catalog to remain safe across restarts.
 
 ## Where to look when modifying behavior
-- Tape handling: `ensure_tape_ready()`, `rotate_tape()`, and `mtx` helpers in [backup-to-tape.sh](backup-to-tape.sh).
-- Copy/verify semantics: `copy_bucket_atomic()` and `verify_copy()` in [backup-to-tape.sh](backup-to-tape.sh).
+- Tape handling: `ensure_tape_ready()`, `rotate_tape()`, and `mtx` helpers in [backup-to-tape.sh](../backup-to-tape.sh).
+- Copy/verify semantics: `copy_bucket_atomic()` and `verify_copy()` in [backup-to-tape.sh](../backup-to-tape.sh).
 - Index discovery and bucket selection: `discover_indexes()` and `list_buckets_for_index()`.
 
 ## Testing without tape hardware

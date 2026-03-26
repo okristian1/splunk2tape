@@ -10,8 +10,7 @@
 - `SPLUNK_DB` defaults to `/archdisk/splunk_db`; `BACKUP_ROOT` controls the tape mount path.
 - `MOUNT_CMD` / `UMOUNT_CMD` override tape filesystem mount handling. By default the script mounts with `ltfs` using `LTFS_DEVNAME` and unmounts with `umount`, so tape rotation works without extra exports in common LTFS setups.
 - `VERIFY_METHOD=size|none` controls integrity checks (size compares total regular-file bytes via `stat`).
-- `MIN_FREE_BYTES` and `SOFT_LIMIT_BYTES` control tape capacity behavior; soft limit forces serial mode.
-- `PARALLELISM` defaults to 1 because tape is sequential; higher values are only sensible for VTL backends.
+- `MIN_FREE_BYTES` and `SOFT_LIMIT_BYTES` control tape capacity behavior.
 - `CPU_NICE_LEVEL`, `IO_NICE_CLASS`, `IO_NICE_LEVEL` lower process priority to protect a busy Splunk indexer.
 - `SKIP_MOUNT_CHECK=1` bypasses the `mountpoint -q` check (for testing on plain directories).
 

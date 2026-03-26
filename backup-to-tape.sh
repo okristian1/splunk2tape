@@ -62,9 +62,6 @@ LOCK_FILE="${LOCK_FILE:-/var/lock/splunk_coldb_backup.lock}"
 # Dry run (1 = simulate, do not copy)
 DRY_RUN="${DRY_RUN:-0}"
  
-# Parallel copies (for tape, keep 1 unless your VTL backend benefits from concurrency)
-PARALLELISM="${PARALLELISM:-1}"
- 
 # Verification method: "size" (du -sb) or "none"
 VERIFY_METHOD="${VERIFY_METHOD:-size}"
  
@@ -84,17 +81,6 @@ RUN_MANIFEST_INDEX="${RUN_MANIFEST_INDEX:-$STATE_DIR/run_${RUN_ID}_manifests.lis
  
 # Capacity control (soft stop before tape fills). Set e.g. 9500000000000 (≈9.5 TB). 0 = disabled.
 SOFT_LIMIT_BYTES="${SOFT_LIMIT_BYTES:-0}"
- 
-# If soft limit is enabled, force serial copies to keep accounting precise
-if (( SOFT_LIMIT_BYTES > 0 )); then
-  PARALLELISM=1
-fi
-
-# The tape workflow is stateful and sequential. Keep execution serial until
-# parallel job bookkeeping and stop semantics are redesigned.
-if (( PARALLELISM > 1 )); then
-  PARALLELISM=1
-fi
 
 
 # --- Tape changer integration ---
@@ -128,6 +114,12 @@ MIN_FREE_BYTES="${MIN_FREE_BYTES:-200000000000}"  # 200GB safety margin
 timestamp() { date +"%Y-%m-%d %H:%M:%S%z"; }
 log()       { echo "[$(timestamp)] $*" | tee -a "$LOG_FILE" >&2; }
 err()       { echo "[$(timestamp)] [ERROR] $*" | tee -a "$LOG_FILE" >&2; }
+
+declare -A LEDGER_CACHE=()
+LEDGER_CACHE_LOADED=0
+MANIFEST_MIRROR_DIRTY=0
+MANIFEST_APPENDS_SINCE_SYNC=0
+MANIFEST_SYNC_EVERY=100
  
 have_cmd()  { command -v "$1" >/dev/null 2>&1; }
 
@@ -209,16 +201,17 @@ path_mtime_epoch() {
   stat --format='%Y' -- "$path" 2>/dev/null
 }
 
-bucket_newest_mtime_epoch() {
+collect_bucket_metadata() {
   local bucket="$1"
 
-  find "$bucket" -printf '%T@\n' 2>/dev/null \
-    | awk 'BEGIN{max=0} {v=int($1); if (v>max) max=v} END{print max+0}'
+  find "$bucket" -printf '%T@ %y %s\n' 2>/dev/null \
+    | awk 'BEGIN{max=0; sum=0} {mtime=int($1); if (mtime>max) max=mtime; if ($2=="f") sum+=$3} END{printf "%s %s\n", sum+0, max+0}'
 }
 
 bucket_skip_reason() {
   local bucket="$1"
-  local now dir_mtime newest_mtime dir_age quiet_age
+  local newest_mtime="$2"
+  local now dir_mtime dir_age quiet_age
 
   now=$(date +%s)
 
@@ -237,7 +230,6 @@ bucket_skip_reason() {
   fi
 
   if (( BUCKET_MIN_QUIET_SECONDS > 0 )); then
-    newest_mtime="$(bucket_newest_mtime_epoch "$bucket")"
     if [[ -z "$newest_mtime" || "$newest_mtime" == "0" ]]; then
       printf 'cannot determine newest content mtime'
       return 0
@@ -449,6 +441,24 @@ record_manifest_path() {
   touch "$RUN_MANIFEST_INDEX"
   grep -Fxq -- "$manifest_path" "$RUN_MANIFEST_INDEX" || echo "$manifest_path" >> "$RUN_MANIFEST_INDEX"
 }
+
+manifest_mirror_path() {
+  printf '%s/%s\n' "$TAPE_MANIFEST_DIR" "$(basename "$TAPE_MANIFEST_ON_TAPE")"
+}
+
+sync_tape_manifest_mirror() {
+  local mirror_path
+
+  if [[ "$DRY_RUN" == "1" || "$MANIFEST_MIRROR_DIRTY" != "1" ]]; then
+    return 0
+  fi
+
+  mirror_path="$(manifest_mirror_path)"
+  mkdir -p "$TAPE_MANIFEST_DIR"
+  cp -f "$TAPE_MANIFEST_ON_TAPE" "$mirror_path" || true
+  MANIFEST_MIRROR_DIRTY=0
+  MANIFEST_APPENDS_SINCE_SYNC=0
+}
  
 # Rotate tape: mark current as full, unmount, unload, load next, mount
 rotate_tape() {
@@ -461,7 +471,8 @@ rotate_tape() {
  
   log "Finalizing tape manifest for $curtag"
   echo "# EndOfTape VolumeTag=$curtag Time=$(timestamp) Run=$RUN_ID" >> "$TAPE_MANIFEST_ON_TAPE" || true
-  cp -f "$TAPE_MANIFEST_ON_TAPE" "$TAPE_MANIFEST_DIR/$(basename "$TAPE_MANIFEST_ON_TAPE")" || true
+  MANIFEST_MIRROR_DIRTY=1
+  sync_tape_manifest_mirror
  
   unmount_tape_filesystem || true
  
@@ -489,29 +500,51 @@ rotate_tape() {
   TAPE_MANIFEST_ON_TAPE="$BACKUP_ROOT/.manifest_${RUN_ID}_${ntag}.txt"
   : > "$TAPE_MANIFEST_ON_TAPE" || { err "Cannot write manifest on new tape: $TAPE_MANIFEST_ON_TAPE"; exit 13; }
   record_manifest_path "$TAPE_MANIFEST_ON_TAPE"
+  MANIFEST_MIRROR_DIRTY=1
+  sync_tape_manifest_mirror
  
   log "Tape rotated. Now using VolumeTag=$ntag"
 }
  
 # --- Ledger & Manifests ---
+
+load_ledger_cache() {
+  local rel
+
+  LEDGER_CACHE=()
+  if [[ -f "$LEDGER_FILE" ]]; then
+    while IFS= read -r rel; do
+      [[ -n "$rel" ]] || continue
+      LEDGER_CACHE["$rel"]=1
+    done < "$LEDGER_FILE"
+  fi
+  LEDGER_CACHE_LOADED=1
+}
  
 already_in_ledger() {
   local rel="$1"  # format: index/bucketname
-  [[ -f "$LEDGER_FILE" ]] && grep -Fxq -- "$rel" "$LEDGER_FILE"
+  (( LEDGER_CACHE_LOADED )) || load_ledger_cache
+  [[ -n "${LEDGER_CACHE[$rel]:-}" ]]
 }
  
 mark_ledger() {
   local rel="$1"
+  if already_in_ledger "$rel"; then
+    return 0
+  fi
   mkdir -p "$(dirname "$LEDGER_FILE")"
   { flock -x 9; echo "$rel" >> "$LEDGER_FILE"; } 9>>"$LEDGER_FILE"
+  LEDGER_CACHE["$rel"]=1
 }
  
 append_to_tape_manifest() {
   local rel="$1"
-  mkdir -p "$TAPE_MANIFEST_DIR"
   echo "$rel" >> "$TAPE_MANIFEST_ON_TAPE"
-  # Mirror locally (use the same filename as on tape)
-  cp -f "$TAPE_MANIFEST_ON_TAPE" "$TAPE_MANIFEST_DIR/$(basename "$TAPE_MANIFEST_ON_TAPE")" || true
+  MANIFEST_MIRROR_DIRTY=1
+  (( MANIFEST_APPENDS_SINCE_SYNC++ )) || true
+  if (( MANIFEST_APPENDS_SINCE_SYNC >= MANIFEST_SYNC_EVERY )); then
+    sync_tape_manifest_mirror
+  fi
 }
  
 init_catalog() {
@@ -609,19 +642,33 @@ cleanup_tmp_dir() {
       ;;
   esac
 }
+
+cleanup_stale_tmp_dirs() {
+  local tmp_dir cleaned=0
+
+  while IFS= read -r -d '' tmp_dir; do
+    if cleanup_tmp_dir "$tmp_dir"; then
+      (( cleaned++ )) || true
+      log "Removed stale temp directory: $tmp_dir"
+    fi
+  done < <(find "$BACKUP_ROOT" -type d -path "$BACKUP_ROOT/*/.tmp/*.partial-*" -mmin +60 -print0 2>/dev/null)
+
+  if (( cleaned > 0 )); then
+    log "Removed $cleaned stale temp director$( (( cleaned == 1 )) && printf 'y' || printf 'ies' ) before starting copies"
+  fi
+}
  
 verify_copy() {
-  local src="$1"
+  local src_bytes="$1"
   local dst="$2"
   case "$VERIFY_METHOD" in
     size)
       # Compare total size of regular files only (avoids filesystem-dependent
       # directory entry sizes differing between e.g. ext4 and tmpfs/LTFS)
-      local s d
-      s=$(regular_file_bytes "$src")
+      local d
       d=$(regular_file_bytes "$dst")
-      if [[ "$s" != "$d" ]]; then
-        err "Size mismatch: src=$s dst=$d"
+      if [[ "$src_bytes" != "$d" ]]; then
+        err "Size mismatch: src=$src_bytes dst=$d"
         return 1
       fi
       return 0
@@ -635,6 +682,7 @@ verify_copy() {
 copy_bucket_atomic() {
   local src_bucket="$1"     # /.../colddb/db_* or rb_*
   local dst_index_dir="$2"  # BACKUP_ROOT/<index>
+  local src_bytes="$3"
   local -a rsync_args
   local rsync_bwlimit_kibps
 
@@ -664,11 +712,15 @@ copy_bucket_atomic() {
   fi
  
   # ---------- >>> REAL COPY HAPPENS HERE <<< ----------
-  rsync "${rsync_args[@]}" \
-    -- "$src_bucket"/ "$tmp_dir"/
+  if ! rsync "${rsync_args[@]}" \
+    -- "$src_bucket"/ "$tmp_dir"/; then
+    err "Copy failed before verification: $src_bucket (temp at $tmp_dir). Cleaning up."
+    cleanup_tmp_dir "$tmp_dir" || true
+    return 1
+  fi
   # ---------------------------------------------------
  
-  if verify_copy "$src_bucket" "$tmp_dir"; then
+  if verify_copy "$src_bytes" "$tmp_dir"; then
     mv -- "$tmp_dir" "$final_dst"
     log "Backed up: $src_bucket -> $final_dst"
   else
@@ -693,7 +745,7 @@ main() {
  
   log "=== Splunk cold bucket backup started ==="
   log "SPLUNK_DB=$SPLUNK_DB BACKUP_ROOT=$BACKUP_ROOT INCLUDE_DB=$INCLUDE_DB INCLUDE_RB=$INCLUDE_RB DRY_RUN=$DRY_RUN VERIFY=$VERIFY_METHOD RUN_ID=$RUN_ID"
-  log "STATE_DIR=$STATE_DIR LEDGER_FILE=$LEDGER_FILE SOFT_LIMIT_BYTES=$SOFT_LIMIT_BYTES PARALLELISM=$PARALLELISM"
+  log "STATE_DIR=$STATE_DIR LEDGER_FILE=$LEDGER_FILE SOFT_LIMIT_BYTES=$SOFT_LIMIT_BYTES"
   log "BUCKET_MIN_DIR_AGE_SECONDS=$BUCKET_MIN_DIR_AGE_SECONDS BUCKET_MIN_QUIET_SECONDS=$BUCKET_MIN_QUIET_SECONDS"
   log "RSYNC_BWLIMIT_MBIT=$RSYNC_BWLIMIT_MBIT"
  
@@ -709,7 +761,11 @@ main() {
     # Create or touch this run's manifest on the tape (after mount)
     : > "$TAPE_MANIFEST_ON_TAPE" || { err "Cannot write manifest on tape: $TAPE_MANIFEST_ON_TAPE"; exit 4; }
     record_manifest_path "$TAPE_MANIFEST_ON_TAPE"
+    MANIFEST_MIRROR_DIRTY=1
+    sync_tape_manifest_mirror
+    cleanup_stale_tmp_dirs
   fi
+  load_ledger_cache
   log "Current tape VolumeTag=$current_tape_tag"
  
   local indexes
@@ -739,9 +795,12 @@ main() {
     for b in "${buckets[@]}"; do
       (( total++ )) || true
       local bucket_name
+      local bucket_bytes bucket_newest_mtime
       bucket_name=$(basename "$b")
       local rel="$idx/$bucket_name"
       local final_dst="$dst_idx_dir/$bucket_name"
+
+      read -r bucket_bytes bucket_newest_mtime < <(collect_bucket_metadata "$b")
  
       # Ledger-based dedupe across tapes/runs
       if already_in_ledger "$rel"; then
@@ -763,15 +822,11 @@ main() {
       fi
 
       local skip_reason
-      if skip_reason="$(bucket_skip_reason "$b")"; then
+      if skip_reason="$(bucket_skip_reason "$b" "$bucket_newest_mtime")"; then
         (( skipped_active++ )) || true
         log "Skip (active): $rel $skip_reason"
         continue
       fi
- 
-      # Calculate bucket size once (used for free-space checks and catalog)
-      local bucket_bytes
-      bucket_bytes=$(regular_file_bytes "$b")
 
       if [[ "$DRY_RUN" != "1" ]]; then
         # Make sure tape is loaded/mounted; refresh tag (in case of rotation)
@@ -795,8 +850,7 @@ main() {
         fi
       fi
  
-      # Serial mode only; tape workflows depend on ordered state transitions.
-      if copy_bucket_atomic "$b" "$dst_idx_dir"; then
+      if copy_bucket_atomic "$b" "$dst_idx_dir" "$bucket_bytes"; then
         ((copied++)) || true
         if [[ "$DRY_RUN" != "1" ]]; then
           mark_ledger "$rel"
@@ -814,9 +868,8 @@ main() {
       fi
     done
   done
- 
-  # Wait for any background copies to finish (if used)
-  wait || true
+
+  sync_tape_manifest_mirror
  
   log "=== Summary ==="
   log "Total buckets seen: $total"

@@ -142,4 +142,5 @@ bash tools/test-run.sh --dry
 - The script only scans `colddb` under each index. It ignores sibling paths such as `frozendb`, `hotdb`, `warmdb`, and `thaweddb`.
 - The script copies both `db_*` and `rb_*` buckets by default.
 - Recently rolled or recently modified buckets are skipped by default.
-- Tape workflows are forced to serial execution even if `PARALLELISM` is set higher.
+- Tape workflows are serial only; the script does not support parallel copy workers.
+- The script removes stale `.tmp/*.partial-*` directories from the currently mounted tape before starting new copies.

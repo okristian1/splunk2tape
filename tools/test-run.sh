@@ -42,6 +42,21 @@ cleanup() {
   echo "    Done."
 }
 
+create_bucket() {
+  local bucket_dir="$1"
+  local block_count="$2"
+
+  mkdir -p "$bucket_dir"
+  dd if=/dev/urandom of="$bucket_dir/rawdata.dat" bs=4096 count="$block_count" status=none 2>/dev/null
+  echo "bucket metadata" > "$bucket_dir/.metadata"
+  find "$bucket_dir" -exec touch -d '2 hours ago' {} +
+  touch -d '2 hours ago' "$bucket_dir"
+}
+
+run_backup() {
+  bash "$REPO_DIR/backup-to-tape.sh"
+}
+
 if [[ "${1:-}" == "--clean" ]]; then
   cleanup
   exit 0
@@ -68,19 +83,11 @@ for idx in main security syslog; do
 
   for i in 1 2 3; do
     bdir="$colddb/db_1707000000_1706900000_${i}_GUID-$(uuidgen 2>/dev/null || echo "aaaa-bbbb-$i")"
-    mkdir -p "$bdir"
-    # Write some random data so du/rsync/verify have something real to work with
-    dd if=/dev/urandom of="$bdir/rawdata.dat" bs=4096 count=10 status=none 2>/dev/null
-    echo "bucket metadata" > "$bdir/.metadata"
-    find "$bdir" -exec touch -d '2 hours ago' {} +
-    touch -d '2 hours ago' "$bdir"
+    create_bucket "$bdir" 10
   done
   # One rb_ bucket per index to exercise INCLUDE_RB
   rbdir="$colddb/rb_1707000000_1706900000_0_GUID-$(uuidgen 2>/dev/null || echo "cccc-dddd")"
-  mkdir -p "$rbdir"
-  dd if=/dev/urandom of="$rbdir/rawdata.dat" bs=4096 count=5 status=none 2>/dev/null
-  find "$rbdir" -exec touch -d '2 hours ago' {} +
-  touch -d '2 hours ago' "$rbdir"
+  create_bucket "$rbdir" 5
 
   if [[ "$idx" == "main" ]]; then
     recent_bucket="$colddb/db_1707100000_1707000000_recent_GUID-$(uuidgen 2>/dev/null || echo "recent-guid")"
@@ -135,6 +142,8 @@ export LOG_DIR="$FAKE_LOG_DIR"
 export LOG_FILE="$FAKE_LOG_DIR/run.log"
 export LOCK_FILE="$FAKE_LOCK"
 export RUN_ID="${RUN_ID:-testrun_$(date +%Y%m%d_%H%M%S)}"
+initial_run_id="$RUN_ID"
+rerun_run_id=""
 export MTX_DEV="/dev/null"
 export MOUNT_CMD="bash $SCRIPT_DIR/test-media-mount.sh mount"
 export UMOUNT_CMD="bash $SCRIPT_DIR/test-media-mount.sh umount"
@@ -145,7 +154,6 @@ export SOFT_LIMIT_BYTES=0
 export INCLUDE_DB=1
 export INCLUDE_RB=1
 export VERIFY_METHOD=size
-export PARALLELISM=1
 export STOP_ON_COPY_ERROR=1
 export BUCKET_MIN_DIR_AGE_SECONDS=1800
 export BUCKET_MIN_QUIET_SECONDS=900
@@ -157,14 +165,43 @@ else
   export DRY_RUN=0
 fi
 
+stale_partial="$FAKE_MEDIA_ROOT/WA0001L9/main/.tmp/db_stale.partial-9999"
+mkdir -p "$stale_partial"
+echo "orphaned temp data" > "$stale_partial/orphan.dat"
+find "$stale_partial" -exec touch -d '2 hours ago' {} +
+touch -d '2 hours ago' "$stale_partial"
+
 # 7. Run the backup
 echo ""
 echo "================================================================"
 echo "  Running backup-to-tape.sh"
 echo "================================================================"
 echo ""
-bash "$REPO_DIR/backup-to-tape.sh"
-rc=$?
+if run_backup; then
+  rc=0
+else
+  rc=$?
+fi
+
+rerun_rc=0
+incremental_bucket=""
+if [[ "$DRY_RUN" != "1" && $rc -eq 0 ]]; then
+  incremental_bucket="$FAKE_SPLUNK_DB/security/colddb/db_1707300000_1707200000_new_GUID-$(uuidgen 2>/dev/null || echo "new-guid")"
+  create_bucket "$incremental_bucket" 6
+  export RUN_ID="${RUN_ID}_rerun"
+  rerun_run_id="$RUN_ID"
+
+  echo ""
+  echo "================================================================"
+  echo "  Running incremental rerun"
+  echo "================================================================"
+  echo ""
+  if run_backup; then
+    rerun_rc=0
+  else
+    rerun_rc=$?
+  fi
+fi
 
 # 8. Assertions for cleaning-cartridge filtering and rotation
 echo ""
@@ -218,14 +255,24 @@ else
   assert_failed=1
 fi
 
-manifest_tape1="$FAKE_MEDIA_ROOT/WA0001L9/.manifest_${RUN_ID}.txt"
-manifest_tape2="$FAKE_MEDIA_ROOT/WA0003L9/.manifest_${RUN_ID}_WA0003L9.txt"
+manifest_tape1="$FAKE_MEDIA_ROOT/WA0001L9/.manifest_${initial_run_id}.txt"
+manifest_tape2="$FAKE_MEDIA_ROOT/WA0003L9/.manifest_${initial_run_id}_WA0003L9.txt"
+rerun_manifest="$FAKE_MEDIA_ROOT/WA0003L9/.manifest_${rerun_run_id}.txt"
 if [[ -f "$manifest_tape1" && -f "$manifest_tape2" ]]; then
   echo "PASS: per-tape manifests exist on both simulated tapes"
 else
   echo "FAIL: expected manifests on both simulated tapes"
   echo "      missing? tape1=$( [[ -f "$manifest_tape1" ]] && echo no || echo yes ) tape2=$( [[ -f "$manifest_tape2" ]] && echo no || echo yes )"
   assert_failed=1
+fi
+
+if [[ "$DRY_RUN" != "1" ]]; then
+  if [[ -f "$rerun_manifest" ]]; then
+    echo "PASS: rerun manifest exists on the currently loaded tape"
+  else
+    echo "FAIL: rerun manifest is missing from the currently loaded tape"
+    assert_failed=1
+  fi
 fi
 
 if find "$FAKE_MEDIA_ROOT" \( -name warmdb -o -name hotdb -o -name frozendb -o -name thaweddb -o -name 'db_warm_*' -o -name 'db_hot_*' -o -name 'db_frozen_*' -o -name 'db_thawed_*' \) | grep -q .; then
@@ -247,6 +294,37 @@ if grep -Eq 'main/db_1707100000_1707000000_recent_|main/db_1707200000_1707100000
   assert_failed=1
 else
   echo "PASS: active buckets were not added to the ledger"
+fi
+
+if [[ ! -d "$FAKE_MEDIA_ROOT/WA0001L9/main/.tmp/db_stale.partial-9999" ]]; then
+  echo "PASS: stale partial directory was cleaned before copy"
+else
+  echo "FAIL: stale partial directory was not cleaned"
+  assert_failed=1
+fi
+
+if [[ "$DRY_RUN" != "1" ]]; then
+  if [[ $rerun_rc -eq 0 ]]; then
+    echo "PASS: incremental rerun completed successfully"
+  else
+    echo "FAIL: incremental rerun exited with code $rerun_rc"
+    assert_failed=1
+  fi
+
+  if grep -q "Skip (ledger):" "$FAKE_LOG_DIR/run.log"; then
+    echo "PASS: rerun reused the ledger to skip previously archived buckets"
+  else
+    echo "FAIL: rerun did not log any ledger-based skips"
+    assert_failed=1
+  fi
+
+  if [[ -n "$incremental_bucket" ]] \
+    && grep -Fq "security/$(basename "$incremental_bucket")" "$FAKE_STATE_DIR/buckets_done.log" 2>/dev/null; then
+    echo "PASS: rerun archived the new bucket and recorded it in the ledger"
+  else
+    echo "FAIL: rerun did not archive the new bucket"
+    assert_failed=1
+  fi
 fi
 
 # 9. Show results
@@ -276,7 +354,8 @@ find "$FAKE_MEDIA_ROOT" -mindepth 1 -maxdepth 3 \( -type d -o -type f \) 2>/dev/
 echo ""
 
 echo "--- Per-tape manifests ---"
-for manifest in "$manifest_tape1" "$manifest_tape2"; do
+for manifest in "$manifest_tape1" "$manifest_tape2" "$rerun_manifest"; do
+  [[ -n "$manifest" ]] || continue
   if [[ -f "$manifest" ]]; then
     echo "[$manifest]"
     sed -n '1,40p' "$manifest"
@@ -293,7 +372,7 @@ echo ""
 
 echo "Done. To clean up: bash tools/test-run.sh --clean"
 
-if (( rc == 0 && assert_failed == 0 )); then
+if (( rc == 0 && rerun_rc == 0 && assert_failed == 0 )); then
   exit 0
 fi
 exit 1

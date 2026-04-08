@@ -143,11 +143,18 @@ rsync_bwlimit_kib() {
 }
  
 acquire_lock() {
-  exec 200>"$LOCK_FILE"
-  if ! flock -n 200; then
+  # Use flock as a wrapper process so child processes do not inherit a lock FD.
+  # This avoids stale lock behavior when long-lived subprocesses survive script exit.
+  if [[ "${LOCK_HELD:-0}" == "1" ]]; then
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$LOCK_FILE")"
+  if ! env LOCK_HELD=1 flock -n --close "$LOCK_FILE" "$0" "$@"; then
     err "Another backup is already running (lock: $LOCK_FILE). Exiting."
     exit 1
   fi
+  exit 0
 }
  
 # Ensure BACKUP_ROOT is an actual mount, not an empty local dir
@@ -736,7 +743,7 @@ main() {
   mkdir -p "$LOG_DIR"
   touch "$LOG_FILE"
  
-  acquire_lock
+  acquire_lock "$@"
   mkdir -p "$BACKUP_ROOT"
   if [[ "$DRY_RUN" != "1" ]]; then
     mkdir -p "$STATE_DIR" "$TAPE_MANIFEST_DIR"

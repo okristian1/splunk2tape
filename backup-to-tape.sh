@@ -57,6 +57,7 @@ BUCKET_MIN_QUIET_SECONDS="${BUCKET_MIN_QUIET_SECONDS:-900}"
 # Logging and locking
 LOG_DIR="${LOG_DIR:-/var/log/splunk-coldb-backup}"
 LOG_FILE="${LOG_FILE:-$LOG_DIR/run.log}"
+LOG_LEVEL="${LOG_LEVEL:-info}"   # trace|debug|info|warn|error
 LOCK_FILE="${LOCK_FILE:-/var/lock/splunk_coldb_backup.lock}"
  
 # Dry run (1 = simulate, do not copy)
@@ -111,9 +112,216 @@ MIN_FREE_BYTES="${MIN_FREE_BYTES:-200000000000}"  # 200GB safety margin
 # ====== Utilities  =======
 ############################
  
-timestamp() { date +"%Y-%m-%d %H:%M:%S%z"; }
-log()       { echo "[$(timestamp)] $*" | tee -a "$LOG_FILE" >&2; }
-err()       { echo "[$(timestamp)] [ERROR] $*" | tee -a "$LOG_FILE" >&2; }
+timestamp() { date -Is; }
+
+append_main_log() {
+  local level="$1"
+  local msg="$2"
+  local line
+
+  should_log_level "$level" || return 0
+
+  line="$(timestamp) level=$level run_id=$(kv_format "$RUN_ID") msg=$(kv_format "$msg")"
+  printf '%s\n' "$line" | tee -a "$LOG_FILE" >&2
+}
+
+log() { append_main_log "info" "$1"; }
+err() { append_main_log "error" "$1"; }
+log_debug() { append_main_log "debug" "$1"; }
+log_trace() { append_main_log "trace" "$1"; }
+
+RUN_COMPLETION_REASON="not_started"
+SPLUNK_RUN_START_EMITTED=0
+SPLUNK_RUN_END_EMITTED=0
+
+normalize_log_level() {
+  local level="${1:-info}"
+  level="${level,,}"
+  case "$level" in
+    trace|debug|info|warn|error) printf '%s' "$level" ;;
+    err) printf '%s' "error" ;;
+    *) printf '%s' "info" ;;
+  esac
+}
+
+log_level_rank() {
+  case "$(normalize_log_level "$1")" in
+    trace) echo 10 ;;
+    debug) echo 20 ;;
+    info)  echo 30 ;;
+    warn)  echo 40 ;;
+    error) echo 50 ;;
+  esac
+}
+
+should_log_level() {
+  local msg_rank cfg_rank
+  msg_rank="$(log_level_rank "$1")"
+  cfg_rank="$(log_level_rank "$LOG_LEVEL")"
+  (( msg_rank >= cfg_rank ))
+}
+
+epoch_ms_now() {
+  if [[ -n "${EPOCHREALTIME:-}" ]]; then
+    local sec frac
+    sec="${EPOCHREALTIME%.*}"
+    frac="${EPOCHREALTIME#*.}"
+    frac="${frac}000"
+    echo "${sec}${frac:0:3}"
+  else
+    echo "$(( $(date +%s) * 1000 ))"
+  fi
+}
+
+kv_quote() {
+  local v="$1"
+  v="${v//\\/\\\\}"
+  v="${v//\"/\\\"}"
+  printf '"%s"' "$v"
+}
+
+kv_format() {
+  local v="$1"
+  if [[ "$v" =~ [[:space:]] ]]; then
+    kv_quote "$v"
+  else
+    printf '%s' "$v"
+  fi
+}
+
+append_splunk_event() {
+  local event_name="$1"
+  shift || true
+
+  local now_iso
+  local pair key value level="info"
+  local -a pairs=()
+  local line
+
+  now_iso="$(date -Is)"
+  for pair in "$@"; do
+    [[ "$pair" == *=* ]] || continue
+    key="${pair%%=*}"
+    value="${pair#*=}"
+    if [[ "$key" == "level" ]]; then
+      level="$value"
+      continue
+    fi
+    pairs+=("$pair")
+  done
+
+  should_log_level "$level" || return 0
+
+  line="$now_iso level=$(kv_format "$level") event=$event_name run_id=$(kv_format "$RUN_ID")"
+
+  for pair in "${pairs[@]}"; do
+    [[ "$pair" == *=* ]] || continue
+    key="${pair%%=*}"
+    value="${pair#*=}"
+    line+=" $key=$(kv_format "$value")"
+  done
+
+  mkdir -p "$(dirname "$LOG_FILE")"
+  printf '%s\n' "$line" >> "$LOG_FILE"
+}
+
+emit_run_start_once() {
+  if [[ "$SPLUNK_RUN_START_EMITTED" == "1" ]]; then
+    return 0
+  fi
+
+  append_splunk_event "run_start" "level=info"
+  SPLUNK_RUN_START_EMITTED=1
+}
+
+emit_run_end_once() {
+  local run_status="$1"
+  local completion_reason="$2"
+
+  if [[ "$SPLUNK_RUN_START_EMITTED" != "1" || "$SPLUNK_RUN_END_EMITTED" == "1" ]]; then
+    return 0
+  fi
+
+  append_splunk_event "run_end" "level=info" "status=$run_status" "completion_reason=$completion_reason"
+  SPLUNK_RUN_END_EMITTED=1
+}
+
+on_script_exit() {
+  local exit_code="$1"
+  local run_status="success"
+  local completion_reason="$RUN_COMPLETION_REASON"
+
+  if [[ "$SPLUNK_RUN_START_EMITTED" != "1" ]]; then
+    return 0
+  fi
+
+  if (( exit_code != 0 )); then
+    run_status="failed"
+    if [[ -z "$completion_reason" || "$completion_reason" == "completed" || "$completion_reason" == "not_started" ]]; then
+      completion_reason="exit_${exit_code}"
+    fi
+  elif [[ -z "$completion_reason" || "$completion_reason" == "not_started" ]]; then
+    completion_reason="completed"
+  fi
+
+  emit_run_end_once "$run_status" "$completion_reason"
+}
+
+append_splunk_summary() {
+  local run_status="$1"
+  local last_used_tape_tag="$2"
+  local tape_tags_csv="$3"
+  local indexes_seen="$4"
+  local total="$5"
+  local skipped="$6"
+  local skipped_active="$7"
+  local copied="$8"
+  local failed="$9"
+  local bytes_written="${10}"
+  local duration_seconds="${11}"
+  local duration_ms="${12}"
+  local completion_reason="${13}"
+  local tapes_touched_count="${14}"
+  local host
+
+  host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)"
+
+  append_splunk_event "run_summary" \
+    "level=info" \
+    "status=$run_status" \
+    "completion_reason=$completion_reason" \
+    "host=$host" \
+    "dry_run=$DRY_RUN" \
+    "verify=$VERIFY_METHOD" \
+    "include_db=$INCLUDE_DB" \
+    "include_rb=$INCLUDE_RB" \
+    "last_used_volume_tag=$last_used_tape_tag" \
+    "volume_tags_seen=$tape_tags_csv" \
+    "tapes_touched=$tapes_touched_count" \
+    "indexes_seen=$indexes_seen" \
+    "total_buckets_seen=$total" \
+    "buckets_copied=$copied" \
+    "buckets_failed=$failed" \
+    "buckets_skipped=$skipped" \
+    "buckets_skipped_active=$skipped_active" \
+    "bytes_written=$bytes_written" \
+    "soft_limit_bytes=$SOFT_LIMIT_BYTES" \
+    "duration_seconds=$duration_seconds" \
+    "duration_ms=$duration_ms"
+}
+
+declare -A TAPES_TOUCHED_MAP=()
+declare -a TAPES_TOUCHED_ORDER=()
+
+record_tape_touched() {
+  local tag="$1"
+  [[ -n "$tag" ]] || return 0
+
+  if [[ -z "${TAPES_TOUCHED_MAP[$tag]:-}" ]]; then
+    TAPES_TOUCHED_MAP["$tag"]=1
+    TAPES_TOUCHED_ORDER+=("$tag")
+  fi
+}
 
 declare -A LEDGER_CACHE=()
 LEDGER_CACHE_LOADED=0
@@ -165,6 +373,7 @@ ensure_mount() {
   fi
   if ! mountpoint -q "$BACKUP_ROOT"; then
     err "Backup root $BACKUP_ROOT is not a mountpoint. Tape/library not mounted? Aborting."
+    RUN_COMPLETION_REASON="mount_check_failed"
     exit 3
   fi
 }
@@ -268,7 +477,7 @@ require_cmds() {
     missing=1
   fi
 
-  (( missing == 0 )) || { err "Install required commands and re-run."; exit 1; }
+  (( missing == 0 )) || { err "Install required commands and re-run."; RUN_COMPLETION_REASON="missing_required_commands"; exit 1; }
 }
 
 mount_tape_filesystem() {
@@ -409,16 +618,19 @@ ensure_tape_ready() {
   tag="$(get_loaded_tape_tag || true)"
   if loaded_tape_is_cleaning; then
     err "Loaded media in drive $TAPE_DRIVE is a cleaning cartridge. Refusing to use it for backups."
+    RUN_COMPLETION_REASON="loaded_cleaning_cartridge"
     exit 14
   fi
   if [[ -n "$tag" ]] && ! slot_has_allowed_tag "$tag"; then
     err "Loaded media VolumeTag=$tag does not match DATA_TAPE_TAG_REGEX. Refusing to use it for backups."
+    RUN_COMPLETION_REASON="loaded_tape_tag_rejected"
     exit 15
   fi
   if [[ -z "$tag" ]]; then
     local next
     if ! next="$(find_next_tape_slot)"; then
       err "No available non-cleaning data tapes found in slots $SLOT_FIRST-$SLOT_LAST."
+      RUN_COMPLETION_REASON="no_available_tapes"
       exit 10
     fi
     local slot="${next%%:*}"
@@ -488,12 +700,14 @@ rotate_tape() {
     unload_tape_to_slot "$curslot"
   else
     err "Could not determine original slot for loaded tape. Please unload manually."
+    RUN_COMPLETION_REASON="unknown_loaded_tape_slot"
     exit 11
   fi
  
   local next
   if ! next="$(find_next_tape_slot)"; then
     err "No remaining tapes available after marking $curtag full."
+    RUN_COMPLETION_REASON="no_remaining_tapes"
     exit 12
   fi
   local slot="${next%%:*}"
@@ -505,7 +719,7 @@ rotate_tape() {
  
   # Start a new manifest on the new tape (new RUN_ID optional; keeping same RUN_ID is fine)
   TAPE_MANIFEST_ON_TAPE="$BACKUP_ROOT/.manifest_${RUN_ID}_${ntag}.txt"
-  : > "$TAPE_MANIFEST_ON_TAPE" || { err "Cannot write manifest on new tape: $TAPE_MANIFEST_ON_TAPE"; exit 13; }
+  : > "$TAPE_MANIFEST_ON_TAPE" || { err "Cannot write manifest on new tape: $TAPE_MANIFEST_ON_TAPE"; RUN_COMPLETION_REASON="cannot_write_rotated_manifest"; exit 13; }
   record_manifest_path "$TAPE_MANIFEST_ON_TAPE"
   MANIFEST_MIRROR_DIRTY=1
   sync_tape_manifest_mirror
@@ -738,12 +952,25 @@ copy_bucket_atomic() {
 }
  
 main() {
+  local run_started_epoch run_finished_epoch run_duration_seconds
+  local run_started_ms run_finished_ms run_duration_ms
+  local tape_tags_csv=""
+  local tapes_touched_count=0
+  TAPES_TOUCHED_MAP=()
+  TAPES_TOUCHED_ORDER=()
+
   ensure_low_priority "$@"
-  require_cmds
   mkdir -p "$LOG_DIR"
   touch "$LOG_FILE"
+  require_cmds
  
   acquire_lock "$@"
+  trap 'on_script_exit $?' EXIT
+  RUN_COMPLETION_REASON="completed"
+  run_started_epoch="$(date +%s)"
+  run_started_ms="$(epoch_ms_now)"
+  emit_run_start_once
+
   mkdir -p "$BACKUP_ROOT"
   if [[ "$DRY_RUN" != "1" ]]; then
     mkdir -p "$STATE_DIR" "$TAPE_MANIFEST_DIR"
@@ -751,34 +978,35 @@ main() {
   fi
  
   log "=== Splunk cold bucket backup started ==="
-  log "SPLUNK_DB=$SPLUNK_DB BACKUP_ROOT=$BACKUP_ROOT INCLUDE_DB=$INCLUDE_DB INCLUDE_RB=$INCLUDE_RB DRY_RUN=$DRY_RUN VERIFY=$VERIFY_METHOD RUN_ID=$RUN_ID"
-  log "STATE_DIR=$STATE_DIR LEDGER_FILE=$LEDGER_FILE SOFT_LIMIT_BYTES=$SOFT_LIMIT_BYTES"
-  log "BUCKET_MIN_DIR_AGE_SECONDS=$BUCKET_MIN_DIR_AGE_SECONDS BUCKET_MIN_QUIET_SECONDS=$BUCKET_MIN_QUIET_SECONDS"
-  log "RSYNC_BWLIMIT_MBIT=$RSYNC_BWLIMIT_MBIT"
+  log "Run: id=$RUN_ID dry_run=$DRY_RUN verify=$VERIFY_METHOD"
+  log "Source: $SPLUNK_DB -> Destination: $BACKUP_ROOT"
  
   local current_tape_tag
   if [[ "$DRY_RUN" == "1" ]]; then
     current_tape_tag="$(get_loaded_tape_tag || true)"
     current_tape_tag="${current_tape_tag:-DRY-RUN}"
+    record_tape_touched "$current_tape_tag"
     log "DRY_RUN=1: skipping tape load/rotation and state mutations"
   else
     init_catalog
     touch "$TAPES_FULL_LIST"
     current_tape_tag="$(ensure_tape_ready)"
+    record_tape_touched "$current_tape_tag"
     # Create or touch this run's manifest on the tape (after mount)
-    : > "$TAPE_MANIFEST_ON_TAPE" || { err "Cannot write manifest on tape: $TAPE_MANIFEST_ON_TAPE"; exit 4; }
+    : > "$TAPE_MANIFEST_ON_TAPE" || { err "Cannot write manifest on tape: $TAPE_MANIFEST_ON_TAPE"; RUN_COMPLETION_REASON="cannot_write_initial_manifest"; exit 4; }
     record_manifest_path "$TAPE_MANIFEST_ON_TAPE"
     MANIFEST_MIRROR_DIRTY=1
     sync_tape_manifest_mirror
     cleanup_stale_tmp_dirs
   fi
   load_ledger_cache
-  log "Current tape VolumeTag=$current_tape_tag"
+  log "Current tape: $current_tape_tag"
  
   local indexes
   mapfile -t indexes < <(discover_indexes)
   if (( ${#indexes[@]} == 0 )); then
     err "No indexes with colddb found under $SPLUNK_DB"
+    RUN_COMPLETION_REASON="no_indexes_found"
     exit 1
   fi
  
@@ -838,6 +1066,7 @@ main() {
       if [[ "$DRY_RUN" != "1" ]]; then
         # Make sure tape is loaded/mounted; refresh tag (in case of rotation)
         current_tape_tag="$(ensure_tape_ready)"
+        record_tape_touched "$current_tape_tag"
 
         local free_bytes
         free_bytes="$(tape_free_bytes)"
@@ -847,12 +1076,14 @@ main() {
           log "Not enough space on tape VolumeTag=$current_tape_tag. Free=$(human_bytes "$free_bytes"), need=$(human_bytes "$bucket_bytes") + buffer=$(human_bytes "$MIN_FREE_BYTES"). Rotating..."
           rotate_tape "$current_tape_tag"
           current_tape_tag="$(ensure_tape_ready)"
+          record_tape_touched "$current_tape_tag"
         fi
 
         # Capacity-aware batching (soft limit)
         if (( SOFT_LIMIT_BYTES > 0 )) && (( current_bytes + bucket_bytes > SOFT_LIMIT_BYTES )); then
           log "Soft tape limit reached at $(human_bytes "$current_bytes"); next bucket $rel ($(human_bytes "$bucket_bytes")) would exceed limit $(human_bytes "$SOFT_LIMIT_BYTES")."
           log "Stopping run cleanly for tape rotation. Re-run after mounting next tape."
+          RUN_COMPLETION_REASON="soft_limit_stop"
           break 2  # Leave both loops
         fi
       fi
@@ -869,7 +1100,8 @@ main() {
         ((failed++)) || true
         err "Copy failed: $rel"
         if [[ "$STOP_ON_COPY_ERROR" == "1" ]]; then
-          err "STOP_ON_COPY_ERROR=1 → stopping early (tape full or I/O error?)."
+          err "STOP_ON_COPY_ERROR=1 -> stopping early (tape full or I/O error?)."
+          RUN_COMPLETION_REASON="copy_error_stop"
           break 2
         fi
       fi
@@ -877,6 +1109,20 @@ main() {
   done
 
   sync_tape_manifest_mirror
+
+  run_finished_epoch="$(date +%s)"
+  run_finished_ms="$(epoch_ms_now)"
+  run_duration_seconds=$(( run_finished_epoch - run_started_epoch ))
+  run_duration_ms=$(( run_finished_ms - run_started_ms ))
+  (( run_duration_ms >= 0 )) || run_duration_ms=$(( run_duration_seconds * 1000 ))
+
+  tapes_touched_count=${#TAPES_TOUCHED_ORDER[@]}
+  if (( tapes_touched_count > 0 )); then
+    tape_tags_csv="$(IFS=,; echo "${TAPES_TOUCHED_ORDER[*]}")"
+  else
+    tape_tags_csv="$current_tape_tag"
+    [[ -n "$tape_tags_csv" ]] && tapes_touched_count=1 || tapes_touched_count=0
+  fi
  
   log "=== Summary ==="
   log "Total buckets seen: $total"
@@ -897,6 +1143,12 @@ main() {
     log "Run manifest written to: $TAPE_MANIFEST_ON_TAPE"
     log "Local manifest mirror: $TAPE_MANIFEST_DIR/$(basename "$TAPE_MANIFEST_ON_TAPE")"
   fi
+  if (( failed == 0 )); then
+    append_splunk_summary "success" "$current_tape_tag" "$tape_tags_csv" "${#indexes[@]}" "$total" "$skipped" "$skipped_active" "$copied" "$failed" "$current_bytes" "$run_duration_seconds" "$run_duration_ms" "$RUN_COMPLETION_REASON" "$tapes_touched_count"
+  else
+    append_splunk_summary "failed" "$current_tape_tag" "$tape_tags_csv" "${#indexes[@]}" "$total" "$skipped" "$skipped_active" "$copied" "$failed" "$current_bytes" "$run_duration_seconds" "$run_duration_ms" "$RUN_COMPLETION_REASON" "$tapes_touched_count"
+  fi
+  log "Structured run events appended to main log: $LOG_FILE"
   log "Ledger file: $LEDGER_FILE"
   log "=== Done ==="
  

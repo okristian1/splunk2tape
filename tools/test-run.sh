@@ -8,6 +8,8 @@
 #   3. Resets mock tape changer state
 #   4. Sets all env vars to test-friendly values
 #   5. Runs backup-to-tape.sh
+#   6. Adds one new bucket and runs backup-to-tape.sh again (incremental rerun)
+#      to verify idempotency/ledger behavior in the same harness invocation.
 #   6. Shows results (catalog, ledger, tape contents)
 #
 # Usage (as root, or with sudo):
@@ -186,6 +188,8 @@ fi
 rerun_rc=0
 incremental_bucket=""
 if [[ "$DRY_RUN" != "1" && $rc -eq 0 ]]; then
+  # Intentional second run: simulate "next cycle" by adding one fresh bucket,
+  # then rerun backup to prove only new data is copied and prior buckets are skipped.
   incremental_bucket="$FAKE_SPLUNK_DB/security/colddb/db_1707300000_1707200000_new_GUID-$(uuidgen 2>/dev/null || echo "new-guid")"
   create_bucket "$incremental_bucket" 6
   export RUN_ID="${RUN_ID}_rerun"

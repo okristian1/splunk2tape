@@ -365,6 +365,35 @@ acquire_lock() {
   exit 0
 }
  
+# Guard: BACKUP_ROOT and SPLUNK_DB must be disjoint trees.
+# Without this, a misconfigured BACKUP_ROOT pointing inside SPLUNK_DB would pass
+# validate_copy_paths() (both the src and dst checks succeed independently)
+# and rsync would write into the live Splunk index directory.
+validate_path_safety() {
+  local real_splunk_db real_backup_root
+  # realpath -m normalises without requiring the paths to exist yet
+  real_splunk_db="$(realpath -m -- "$SPLUNK_DB")"
+  real_backup_root="$(realpath -m -- "$BACKUP_ROOT")"
+
+  if [[ -z "$real_splunk_db" || -z "$real_backup_root" ]]; then
+    err "Cannot resolve SPLUNK_DB or BACKUP_ROOT for path safety check."
+    RUN_COMPLETION_REASON="path_safety_check_failed"
+    exit 1
+  fi
+
+  if [[ "$real_backup_root" == "$real_splunk_db" || "$real_backup_root" == "$real_splunk_db/"* ]]; then
+    err "BACKUP_ROOT ($BACKUP_ROOT) must not be the same as or under SPLUNK_DB ($SPLUNK_DB). Refusing to run."
+    RUN_COMPLETION_REASON="path_safety_check_failed"
+    exit 1
+  fi
+
+  if [[ "$real_splunk_db" == "$real_backup_root" || "$real_splunk_db" == "$real_backup_root/"* ]]; then
+    err "SPLUNK_DB ($SPLUNK_DB) must not be the same as or under BACKUP_ROOT ($BACKUP_ROOT). Refusing to run."
+    RUN_COMPLETION_REASON="path_safety_check_failed"
+    exit 1
+  fi
+}
+
 # Ensure BACKUP_ROOT is an actual mount, not an empty local dir
 # Set SKIP_MOUNT_CHECK=1 for testing without real tape hardware
 ensure_mount() {
@@ -476,6 +505,14 @@ require_cmds() {
     err "Missing required command: umount"
     missing=1
   fi
+
+  # Validate tape addressing env vars are integers to prevent regex injection in grep -E.
+  local tape_int_bad=0
+  for _var_pair in "TAPE_DRIVE:$TAPE_DRIVE" "SLOT_FIRST:$SLOT_FIRST" "SLOT_LAST:$SLOT_LAST"; do
+    local _name="${_var_pair%%:*}" _val="${_var_pair#*:}"
+    [[ "$_val" =~ ^[0-9]+$ ]] || { err "$_name must be a non-negative integer; got: $_val"; tape_int_bad=1; }
+  done
+  (( tape_int_bad == 0 )) || missing=1
 
   (( missing == 0 )) || { err "Install required commands and re-run."; RUN_COMPLETION_REASON="missing_required_commands"; exit 1; }
 }
@@ -970,6 +1007,7 @@ main() {
   run_started_epoch="$(date +%s)"
   run_started_ms="$(epoch_ms_now)"
   emit_run_start_once
+  validate_path_safety
 
   mkdir -p "$BACKUP_ROOT"
   if [[ "$DRY_RUN" != "1" ]]; then

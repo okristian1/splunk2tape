@@ -1,0 +1,19 @@
+[Unit]
+Description=Splunk cold bucket backup to tape
+Documentation=https://github.com/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Optional environment overrides, for example:
+# LOG_LEVEL=info
+# DRY_RUN=0
+EnvironmentFile=-/etc/default/splunk-tape-backup
+ExecStart=/usr/bin/env bash /opt/splunk_tape_backup/backup-to-tape.sh
+WorkingDirectory=/opt/splunk_tape_backup
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

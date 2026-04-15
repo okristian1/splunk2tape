@@ -27,10 +27,14 @@ ensure_low_priority() {
 
   if have_cmd nice; then
     export LOW_PRIORITY_APPLIED=1
+    # Re-exec through bash so this works even when the script was launched as
+    # `bash /path/script.sh` and does not rely on executable bit on $0.
+    local shell_bin
+    shell_bin="${BASH:-bash}"
     if have_cmd ionice; then
-      exec ionice -c "$IO_NICE_CLASS" -n "$IO_NICE_LEVEL" nice -n "$CPU_NICE_LEVEL" "$0" "$@"
+      exec ionice -c "$IO_NICE_CLASS" -n "$IO_NICE_LEVEL" nice -n "$CPU_NICE_LEVEL" "$shell_bin" "$0" "$@"
     else
-      exec nice -n "$CPU_NICE_LEVEL" "$0" "$@"
+      exec nice -n "$CPU_NICE_LEVEL" "$shell_bin" "$0" "$@"
     fi
   fi
 }

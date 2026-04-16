@@ -6,6 +6,19 @@
 #
 # Requires: bash, find, rsync, du, flock, date, mkdir, mv, awk, cut, mountpoint
 # Optional: numfmt (for pretty sizes)
+
+# If invoked as `sh backup-to-tape.sh` (or `sh -x ...`), re-exec under bash.
+# The script relies on bash features such as arrays, [[ ]], and mapfile.
+if [ -z "${BASH_VERSION:-}" ]; then
+  if command -v bash >/dev/null 2>&1; then
+    case "$-" in
+      *x*) exec bash -x "$0" "$@" ;;
+      *)   exec bash "$0" "$@" ;;
+    esac
+  fi
+  printf '%s\n' "ERROR: This script requires bash." >&2
+  exit 1
+fi
  
 set -Eeuo pipefail
  
@@ -18,6 +31,14 @@ CPU_NICE_LEVEL="${CPU_NICE_LEVEL:-10}"
 IO_NICE_CLASS="${IO_NICE_CLASS:-2}"       # 2=best-effort
 IO_NICE_LEVEL="${IO_NICE_LEVEL:-7}"       # 0-7 (7=lowest)
 RSYNC_BWLIMIT_MBIT="${RSYNC_BWLIMIT_MBIT:-0}"  # 0=unlimited; rsync copy rate cap in Mbit/s
+RSYNC_TIMEOUT_SECONDS="${RSYNC_TIMEOUT_SECONDS:-0}"  # 0=disabled; optional timeout for a single rsync call
+MTX_STATUS_TIMEOUT_SECONDS="${MTX_STATUS_TIMEOUT_SECONDS:-60}"
+MTX_LOAD_TIMEOUT_SECONDS="${MTX_LOAD_TIMEOUT_SECONDS:-180}"
+MTX_UNLOAD_TIMEOUT_SECONDS="${MTX_UNLOAD_TIMEOUT_SECONDS:-180}"
+DF_TIMEOUT_SECONDS="${DF_TIMEOUT_SECONDS:-60}"
+MOUNTPOINT_TIMEOUT_SECONDS="${MOUNTPOINT_TIMEOUT_SECONDS:-20}"
+MANIFEST_MIRROR_COPY_TIMEOUT_SECONDS="${MANIFEST_MIRROR_COPY_TIMEOUT_SECONDS:-60}"
+COMMAND_HEARTBEAT_SECONDS="${COMMAND_HEARTBEAT_SECONDS:-60}"
 
 ensure_low_priority() {
   # Avoid recursion if already re-execed
@@ -332,6 +353,7 @@ LEDGER_CACHE_LOADED=0
 MANIFEST_MIRROR_DIRTY=0
 MANIFEST_APPENDS_SINCE_SYNC=0
 MANIFEST_SYNC_EVERY=100
+LAST_KNOWN_TAPE_TAG=""
  
 have_cmd()  { command -v "$1" >/dev/null 2>&1; }
 
@@ -353,6 +375,55 @@ rsync_bwlimit_kib() {
   (( RSYNC_BWLIMIT_MBIT > 0 )) || return 1
   echo $(( RSYNC_BWLIMIT_MBIT * 1000 * 1000 / 8 / 1024 ))
 }
+
+run_timed_command() {
+  local op_label="$1"
+  local timeout_seconds="$2"
+  shift 2
+
+  local start_ms end_ms duration_ms rc=0
+  local hb_seconds elapsed_seconds
+  local cmd_pid
+  start_ms="$(epoch_ms_now)"
+  hb_seconds="$COMMAND_HEARTBEAT_SECONDS"
+
+  log_debug "Operation start: ${op_label} timeout_seconds=${timeout_seconds}"
+
+  "$@" &
+  cmd_pid=$!
+
+  while kill -0 "$cmd_pid" 2>/dev/null; do
+    sleep "$hb_seconds"
+    if ! kill -0 "$cmd_pid" 2>/dev/null; then
+      break
+    fi
+
+    elapsed_seconds=$(( ( $(epoch_ms_now) - start_ms ) / 1000 ))
+    log_debug "Operation running: ${op_label} elapsed_seconds=${elapsed_seconds} pid=${cmd_pid}"
+
+    if (( timeout_seconds > 0 && elapsed_seconds >= timeout_seconds )); then
+      err "Operation timed out: ${op_label} timeout_seconds=${timeout_seconds}"
+      kill -TERM "$cmd_pid" 2>/dev/null || true
+      sleep 2
+      kill -KILL "$cmd_pid" 2>/dev/null || true
+      break
+    fi
+  done
+
+  if wait "$cmd_pid"; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  end_ms="$(epoch_ms_now)"
+  duration_ms=$(( end_ms - start_ms ))
+  (( duration_ms >= 0 )) || duration_ms=0
+
+  log_debug "Operation finished: ${op_label} rc=${rc} duration_ms=${duration_ms}"
+
+  return "$rc"
+}
  
 acquire_lock() {
   # Use flock as a wrapper process so child processes do not inherit a lock FD.
@@ -361,12 +432,21 @@ acquire_lock() {
     return 0
   fi
 
+  local shell_bin flock_status
+  shell_bin="${BASH:-bash}"
+
   mkdir -p "$(dirname "$LOCK_FILE")"
-  if ! env LOCK_HELD=1 flock -n --close "$LOCK_FILE" "$0" "$@"; then
-    err "Another backup is already running (lock: $LOCK_FILE). Exiting."
-    exit 1
+  if env LOCK_HELD=1 flock -n --close "$LOCK_FILE" "$shell_bin" "$0" "$@"; then
+    exit 0
   fi
-  exit 0
+
+  flock_status=$?
+  if (( flock_status == 1 )); then
+    err "Another backup is already running (lock: $LOCK_FILE). Exiting."
+  else
+    err "Failed to acquire lock (flock exit=$flock_status, lock: $LOCK_FILE). This is not an active-lock conflict; check flock compatibility/permissions and script path."
+  fi
+  exit 1
 }
  
 # Guard: BACKUP_ROOT and SPLUNK_DB must be disjoint trees.
@@ -404,8 +484,17 @@ ensure_mount() {
   if [[ "${SKIP_MOUNT_CHECK:-0}" == "1" ]]; then
     return 0
   fi
-  if ! mountpoint -q "$BACKUP_ROOT"; then
+  local mp_status=0
+  if ! run_timed_command "mountpoint check $BACKUP_ROOT" "$MOUNTPOINT_TIMEOUT_SECONDS" mountpoint -q "$BACKUP_ROOT"; then
+    mp_status=$?
+  fi
+
+  if (( mp_status == 1 )); then
     err "Backup root $BACKUP_ROOT is not a mountpoint. Tape/library not mounted? Aborting."
+    RUN_COMPLETION_REASON="mount_check_failed"
+    exit 3
+  elif (( mp_status != 0 )); then
+    err "Mountpoint check failed unexpectedly (exit=${mp_status}) for $BACKUP_ROOT"
     RUN_COMPLETION_REASON="mount_check_failed"
     exit 3
   fi
@@ -538,11 +627,17 @@ unmount_tape_filesystem() {
 }
  
 tape_status() {
-  mtx -f "$MTX_DEV" status
+  run_timed_command "mtx status" "$MTX_STATUS_TIMEOUT_SECONDS" mtx -f "$MTX_DEV" status
 }
 
 get_loaded_tape_line() {
-  tape_status | grep -E "^Data Transfer Element ${TAPE_DRIVE}:" | head -n 1
+  tape_status | grep -E "^[[:space:]]*Data Transfer Element ${TAPE_DRIVE}:" | head -n 1
+}
+
+drive_has_loaded_media() {
+  local line
+  line="$(get_loaded_tape_line || true)"
+  [[ "$line" == *":Full"* ]]
 }
 
 # Returns VolumeTag of currently loaded tape (empty if none loaded)
@@ -643,21 +738,33 @@ find_next_tape_slot() {
 load_tape_from_slot() {
   local slot="$1"
   log "Loading tape from slot $slot into drive $TAPE_DRIVE ..."
-  mtx -f "$MTX_DEV" load "$slot" "$TAPE_DRIVE"
+  run_timed_command "mtx load slot=$slot drive=$TAPE_DRIVE" "$MTX_LOAD_TIMEOUT_SECONDS" mtx -f "$MTX_DEV" load "$slot" "$TAPE_DRIVE"
 }
  
 # Unload tape from drive -> slot
 unload_tape_to_slot() {
   local slot="$1"
   log "Unloading tape from drive $TAPE_DRIVE back to slot $slot ..."
-  mtx -f "$MTX_DEV" unload "$slot" "$TAPE_DRIVE"
+  run_timed_command "mtx unload slot=$slot drive=$TAPE_DRIVE" "$MTX_UNLOAD_TIMEOUT_SECONDS" mtx -f "$MTX_DEV" unload "$slot" "$TAPE_DRIVE"
 }
  
 # Ensure a tape is loaded & mounted; if no tape, load next
 ensure_tape_ready() {
-  local tag
-  tag="$(get_loaded_tape_tag || true)"
-  if loaded_tape_is_cleaning; then
+  local tag line
+  local drive_full=0
+
+  line="$(get_loaded_tape_line || true)"
+  if [[ "$line" == *":Full"* ]]; then
+    drive_full=1
+  fi
+
+  if [[ "$line" =~ VolumeTag=([^[:space:]]+) ]]; then
+    tag="${BASH_REMATCH[1]}"
+  else
+    tag=""
+  fi
+
+  if [[ "$line" == *"Cleaning Cartridge"* ]]; then
     err "Loaded media in drive $TAPE_DRIVE is a cleaning cartridge. Refusing to use it for backups."
     RUN_COMPLETION_REASON="loaded_cleaning_cartridge"
     exit 14
@@ -667,7 +774,20 @@ ensure_tape_ready() {
     RUN_COMPLETION_REASON="loaded_tape_tag_rejected"
     exit 15
   fi
-  if [[ -z "$tag" ]]; then
+  if [[ -n "$tag" ]]; then
+    LAST_KNOWN_TAPE_TAG="$tag"
+  elif (( drive_full == 1 )); then
+    # Some mtx implementations may not report VolumeTag on the drive line.
+    # If media is loaded, do not attempt another load operation.
+    if [[ -n "$LAST_KNOWN_TAPE_TAG" ]]; then
+      tag="$LAST_KNOWN_TAPE_TAG"
+      log_debug "Drive $TAPE_DRIVE is loaded but VolumeTag is missing in status; reusing last known VolumeTag=$tag"
+    else
+      log_debug "Drive $TAPE_DRIVE is loaded but VolumeTag is missing in status; continuing without a known VolumeTag"
+    fi
+  fi
+
+  if [[ -z "$tag" && $drive_full -eq 0 ]]; then
     local next
     if ! next="$(find_next_tape_slot)"; then
       err "No available non-cleaning data tapes found in slots $SLOT_FIRST-$SLOT_LAST."
@@ -681,8 +801,11 @@ ensure_tape_ready() {
     mount_tape_filesystem
     ensure_mount
     tag="$ntag"
-  elif [[ "${SKIP_MOUNT_CHECK:-0}" != "1" ]] && ! mountpoint -q "$BACKUP_ROOT"; then
-    mount_tape_filesystem
+    LAST_KNOWN_TAPE_TAG="$tag"
+  elif [[ "${SKIP_MOUNT_CHECK:-0}" != "1" ]]; then
+    if ! run_timed_command "mountpoint check $BACKUP_ROOT" "$MOUNTPOINT_TIMEOUT_SECONDS" mountpoint -q "$BACKUP_ROOT"; then
+      mount_tape_filesystem
+    fi
   fi
   # If a tape is already loaded, still verify the mountpoint is valid
   ensure_mount
@@ -691,7 +814,9 @@ ensure_tape_ready() {
  
 tape_free_bytes() {
   # avail bytes on the mounted tape filesystem
-  df -B1 --output=avail "$BACKUP_ROOT" | tail -n 1 | awk '{print $1}'
+  local df_out
+  df_out="$(run_timed_command "df avail $BACKUP_ROOT" "$DF_TIMEOUT_SECONDS" df -B1 --output=avail "$BACKUP_ROOT")" || return 1
+  printf '%s\n' "$df_out" | tail -n 1 | awk '{print $1}'
 }
 
 record_manifest_path() {
@@ -715,7 +840,7 @@ sync_tape_manifest_mirror() {
 
   mirror_path="$(manifest_mirror_path)"
   mkdir -p "$TAPE_MANIFEST_DIR"
-  cp -f "$TAPE_MANIFEST_ON_TAPE" "$mirror_path" || true
+  run_timed_command "mirror manifest to $mirror_path" "$MANIFEST_MIRROR_COPY_TIMEOUT_SECONDS" cp -f "$TAPE_MANIFEST_ON_TAPE" "$mirror_path" || true
   MANIFEST_MIRROR_DIRTY=0
   MANIFEST_APPENDS_SINCE_SYNC=0
 }
@@ -801,11 +926,13 @@ mark_ledger() {
  
 append_to_tape_manifest() {
   local rel="$1"
+  local mirror_path
+
   echo "$rel" >> "$TAPE_MANIFEST_ON_TAPE"
-  MANIFEST_MIRROR_DIRTY=1
-  (( MANIFEST_APPENDS_SINCE_SYNC++ )) || true
-  if (( MANIFEST_APPENDS_SINCE_SYNC >= MANIFEST_SYNC_EVERY )); then
-    sync_tape_manifest_mirror
+  if [[ "$DRY_RUN" != "1" ]]; then
+    mirror_path="$(manifest_mirror_path)"
+    mkdir -p "$TAPE_MANIFEST_DIR"
+    echo "$rel" >> "$mirror_path"
   fi
 }
  
@@ -974,7 +1101,7 @@ copy_bucket_atomic() {
   fi
  
   # ---------- >>> REAL COPY HAPPENS HERE <<< ----------
-  if ! rsync "${rsync_args[@]}" \
+  if ! run_timed_command "rsync bucket=$bucket_name" "$RSYNC_TIMEOUT_SECONDS" rsync "${rsync_args[@]}" \
     -- "$src_bucket"/ "$tmp_dir"/; then
     err "Copy failed before verification: $src_bucket (temp at $tmp_dir). Cleaning up."
     cleanup_tmp_dir "$tmp_dir" || true

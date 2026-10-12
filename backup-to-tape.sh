@@ -80,11 +80,19 @@ LOCK_FILE="${LOCK_FILE:-/var/lock/splunk_coldb_backup.lock}"
 # Dry run (1 = simulate, do not copy)
 DRY_RUN="${DRY_RUN:-0}"
  
-# Verification method: "size" (du -sb) or "none"
-VERIFY_METHOD="${VERIFY_METHOD:-size}"
+# Verification method: sha256 (content readback), size (fast metadata check), or none.
+VERIFY_METHOD="${VERIFY_METHOD:-sha256}"
  
 # If a copy fails (e.g., tape full), stop the run to avoid thrashing
 STOP_ON_COPY_ERROR="${STOP_ON_COPY_ERROR:-1}"
+
+# If 1, fail the run when post-run sweep still finds eligible uncopied buckets.
+STRICT_COMPLETION="${STRICT_COMPLETION:-0}"
+
+# If 1, continue running additional passes until no eligible buckets remain.
+RUN_UNTIL_DRAINED="${RUN_UNTIL_DRAINED:-1}"
+# Optional safety guard: max passes when RUN_UNTIL_DRAINED=1. 0 = unlimited.
+MAX_DRAIN_PASSES="${MAX_DRAIN_PASSES:-0}"
  
 # --- Tape-aware dedupe & manifests ---
 # Durable local state (do NOT put this on tape)
@@ -268,20 +276,47 @@ on_script_exit() {
   local run_status="success"
   local completion_reason="$RUN_COMPLETION_REASON"
 
+  trap - EXIT TERM
+
+  if ! unmount_tape_if_mounted; then
+    err "Failed to unmount tape filesystem at $BACKUP_ROOT during exit cleanup."
+    if (( exit_code == 0 )); then
+      exit_code=17
+      completion_reason="unmount_failed"
+    fi
+  fi
+
   if [[ "$SPLUNK_RUN_START_EMITTED" != "1" ]]; then
-    return 0
+    exit "$exit_code"
   fi
 
   if (( exit_code != 0 )); then
     run_status="failed"
     if [[ -z "$completion_reason" || "$completion_reason" == "completed" || "$completion_reason" == "not_started" ]]; then
-      completion_reason="exit_${exit_code}"
+      case "$exit_code" in
+        2)  completion_reason="copy_failures" ;;
+        3)  completion_reason="mount_failed" ;;
+        10) completion_reason="no_available_tapes" ;;
+        11) completion_reason="unknown_loaded_tape_slot" ;;
+        12) completion_reason="no_remaining_tapes" ;;
+        13) completion_reason="cannot_write_rotated_manifest" ;;
+        14) completion_reason="loaded_cleaning_cartridge" ;;
+        15) completion_reason="loaded_tape_tag_rejected" ;;
+        16) completion_reason="tape_load_failed" ;;
+        17) completion_reason="unmount_failed" ;;
+        18) completion_reason="manifest_finalize_failed" ;;
+        19) completion_reason="loaded_tape_identity_unknown" ;;
+        20) completion_reason="manifest_mirror_failed" ;;
+        21) completion_reason="loaded_tape_identity_mismatch" ;;
+        *)  completion_reason="exit_${exit_code}" ;;
+      esac
     fi
   elif [[ -z "$completion_reason" || "$completion_reason" == "not_started" ]]; then
     completion_reason="completed"
   fi
 
   emit_run_end_once "$run_status" "$completion_reason"
+  exit "$exit_code"
 }
 
 append_splunk_summary() {
@@ -343,9 +378,8 @@ record_tape_touched() {
 declare -A LEDGER_CACHE=()
 LEDGER_CACHE_LOADED=0
 MANIFEST_MIRROR_DIRTY=0
-MANIFEST_APPENDS_SINCE_SYNC=0
-MANIFEST_SYNC_EVERY=100
 LAST_KNOWN_TAPE_TAG=""
+declare -A MANIFEST_ENTRIES_WRITTEN=()
  
 have_cmd()  { command -v "$1" >/dev/null 2>&1; }
 
@@ -369,27 +403,21 @@ rsync_bwlimit_kib() {
 }
  
 acquire_lock() {
-  # Use flock as a wrapper process so child processes do not inherit a lock FD.
-  # This avoids stale lock behavior when long-lived subprocesses survive script exit.
-  if [[ "${LOCK_HELD:-0}" == "1" ]]; then
-    return 0
-  fi
-
-  local shell_bin flock_status
-  shell_bin="${BASH:-bash}"
+  # Keep this Bash process as systemd's main PID so KillMode=mixed delivers
+  # TERM to the shell that owns the LTFS cleanup trap.
+  local lock_fd
 
   mkdir -p "$(dirname "$LOCK_FILE")"
-  if env LOCK_HELD=1 flock -n --close "$LOCK_FILE" "$shell_bin" "$0" "$@"; then
-    exit 0
+  if ! exec {lock_fd}>>"$LOCK_FILE"; then
+    err "Cannot open lock file: $LOCK_FILE"
+    exit 1
   fi
 
-  flock_status=$?
-  if (( flock_status == 1 )); then
+  if ! flock -n "$lock_fd"; then
+    exec {lock_fd}>&-
     err "Another backup is already running (lock: $LOCK_FILE). Exiting."
-  else
-    err "Failed to acquire lock (flock exit=$flock_status, lock: $LOCK_FILE). This is not an active-lock conflict; check flock compatibility/permissions and script path."
+    exit 1
   fi
-  exit 1
 }
  
 # Guard: BACKUP_ROOT and SPLUNK_DB must be disjoint trees.
@@ -533,6 +561,20 @@ require_cmds() {
     missing=1
   fi
 
+  if [[ "$VERIFY_METHOD" == "sha256" ]]; then
+    if ! have_cmd sha256sum && ! have_cmd shasum; then
+      err "VERIFY_METHOD=sha256 requires sha256sum or shasum."
+      missing=1
+    fi
+    for c in cmp mktemp sort xargs; do
+      have_cmd "$c" || { err "VERIFY_METHOD=sha256 requires $c"; missing=1; }
+    done
+    if ! printf '' | LC_ALL=C sort -z >/dev/null 2>&1; then
+      err "VERIFY_METHOD=sha256 requires sort with NUL-delimited (-z) support."
+      missing=1
+    fi
+  fi
+
   # Validate tape addressing env vars are integers to prevent regex injection in grep -E.
   local tape_int_bad=0
   for _var_pair in "TAPE_DRIVE:$TAPE_DRIVE" "SLOT_FIRST:$SLOT_FIRST" "SLOT_LAST:$SLOT_LAST"; do
@@ -545,18 +587,33 @@ require_cmds() {
 }
 
 mount_tape_filesystem() {
+  # Mount output is sent to stderr: this function runs inside
+  # $(ensure_tape_ready) in the copy loop, and any stdout would pollute the
+  # captured VolumeTag return value.
   if [[ -n "$MOUNT_CMD" ]]; then
-    eval "$MOUNT_CMD"
+    eval "$MOUNT_CMD" >&2
   else
-    "$LTFS_BIN" "$BACKUP_ROOT" -o "devname=$LTFS_DEVNAME"
+    "$LTFS_BIN" "$BACKUP_ROOT" -o "devname=$LTFS_DEVNAME" >&2
   fi
 }
 
 unmount_tape_filesystem() {
   if [[ -n "$UMOUNT_CMD" ]]; then
-    eval "$UMOUNT_CMD"
+    eval "$UMOUNT_CMD" >&2
   else
-    umount "$BACKUP_ROOT"
+    umount "$BACKUP_ROOT" >&2
+  fi
+}
+
+unmount_tape_if_mounted() {
+  [[ "$DRY_RUN" != "1" ]] || return 0
+  mountpoint -q "$BACKUP_ROOT" || return 0
+
+  log "Unmounting tape filesystem before script exit"
+  unmount_tape_filesystem || return 1
+  if mountpoint -q "$BACKUP_ROOT"; then
+    err "Unmount command returned success but $BACKUP_ROOT is still mounted."
+    return 1
   fi
 }
  
@@ -566,12 +623,6 @@ tape_status() {
 
 get_loaded_tape_line() {
   tape_status | grep -E "^[[:space:]]*Data Transfer Element ${TAPE_DRIVE}:" | head -n 1
-}
-
-drive_has_loaded_media() {
-  local line
-  line="$(get_loaded_tape_line || true)"
-  [[ "$line" == *":Full"* ]]
 }
 
 # Returns VolumeTag of currently loaded tape (empty if none loaded)
@@ -610,7 +661,13 @@ slot_status_line() {
 slot_is_full() {
   local line
   line="$(slot_status_line "$1" || true)"
-  [[ "$line" == *"Full"* ]]
+  # "Full" means a cartridge is present in the slot (the slot is occupied),
+  # not that the tape has no remaining capacity. Match the state as a whole
+  # word: mtx reports writable tapes as "Not Full", which a bare *Full*
+  # substring test would also match. Note the flip side: firmware that
+  # reports a writable data cartridge as "Not Full" would be skipped by this
+  # test; if your library behaves that way, adjust the selection criteria.
+  [[ "$line" =~ :Full([^[:alnum:]]|$) ]]
 }
 
 slot_is_cleaning() {
@@ -672,7 +729,11 @@ find_next_tape_slot() {
 load_tape_from_slot() {
   local slot="$1"
   log "Loading tape from slot $slot into drive $TAPE_DRIVE ..."
-  mtx -f "$MTX_DEV" load "$slot" "$TAPE_DRIVE"
+  # Real mtx prints load progress to stdout. Redirect it to stderr: this
+  # function runs inside $(ensure_tape_ready) in the copy loop, and any
+  # stdout would pollute the captured VolumeTag return value (mount output
+  # is handled the same way in mount_tape_filesystem).
+  mtx -f "$MTX_DEV" load "$slot" "$TAPE_DRIVE" >&2
 }
  
 # Unload tape from drive -> slot
@@ -681,15 +742,57 @@ unload_tape_to_slot() {
   log "Unloading tape from drive $TAPE_DRIVE back to slot $slot ..."
   mtx -f "$MTX_DEV" unload "$slot" "$TAPE_DRIVE"
 }
+
+verify_loaded_tape_identity() {
+  local expected_tag="$1"
+  local expected_slot="$2"
+  local line actual_slot actual_tag=""
+
+  line="$(get_loaded_tape_line || true)"
+  actual_slot="$(get_loaded_from_slot || true)"
+
+  if [[ "$line" == *"Cleaning Cartridge"* ]]; then
+    err "Refusing to mount cleaning cartridge from slot $expected_slot."
+    return 1
+  fi
+  if [[ -n "$actual_slot" && "$actual_slot" != "$expected_slot" ]]; then
+    err "Loaded tape came from slot $actual_slot; expected slot $expected_slot."
+    return 1
+  fi
+  if [[ "$line" =~ VolumeTag=([^[:space:]]+) ]]; then
+    actual_tag="${BASH_REMATCH[1]}"
+    if [[ "$actual_tag" != "$expected_tag" ]]; then
+      err "Loaded tape VolumeTag=$actual_tag; expected $expected_tag from slot $expected_slot."
+      return 1
+    fi
+  elif [[ "$actual_slot" != "$expected_slot" ]]; then
+    err "Cannot verify loaded tape identity: mtx reports neither the expected slot nor a VolumeTag."
+    return 1
+  fi
+}
+
+# Sync LAST_KNOWN_TAPE_TAG in the *parent* shell. ensure_tape_ready runs
+# inside $(...) in the copy loop, so any assignment it makes to
+# LAST_KNOWN_TAPE_TAG is lost when the subshell exits. Call this in the
+# parent after a successful `current_tape_tag="$(ensure_tape_ready)"` so the
+# fallback tag stays current for later ensure_tape_ready calls.
+sync_known_tape_tag() {
+  if [[ -n "${1:-}" ]]; then
+    LAST_KNOWN_TAPE_TAG="$1"
+  fi
+}
  
 # Ensure a tape is loaded & mounted; if no tape, load next
 ensure_tape_ready() {
   local tag line
-  local drive_full=0
+  # "Full" in mtx output means a cartridge is present (the drive is
+  # occupied), not that the tape has no remaining capacity.
+  local cartridge_in_drive=0
 
   line="$(get_loaded_tape_line || true)"
-  if [[ "$line" == *":Full"* ]]; then
-    drive_full=1
+  # Whole-word match: "Not Full" must not count as Full.
+  if [[ "$line" =~ :Full([^[:alnum:]]|$) ]]; then
+    cartridge_in_drive=1
   fi
 
   if [[ "$line" =~ VolumeTag=([^[:space:]]+) ]]; then
@@ -710,18 +813,22 @@ ensure_tape_ready() {
   fi
   if [[ -n "$tag" ]]; then
     LAST_KNOWN_TAPE_TAG="$tag"
-  elif (( drive_full == 1 )); then
+  elif (( cartridge_in_drive == 1 )); then
     # Some mtx implementations may not report VolumeTag on the drive line.
     # If media is loaded, do not attempt another load operation.
+    # (Assignments made in this $(...) subshell do not persist to the
+    # parent shell; sync_known_tape_tag() is called there after we return.)
     if [[ -n "$LAST_KNOWN_TAPE_TAG" ]]; then
       tag="$LAST_KNOWN_TAPE_TAG"
       log_debug "Drive $TAPE_DRIVE is loaded but VolumeTag is missing in status; reusing last known VolumeTag=$tag"
     else
-      log_debug "Drive $TAPE_DRIVE is loaded but VolumeTag is missing in status; continuing without a known VolumeTag"
+      err "Loaded tape identity is unknown (mtx reports no VolumeTag and this run has no prior tape tag); refusing to write."
+      RUN_COMPLETION_REASON="loaded_tape_identity_unknown"
+      exit 19
     fi
   fi
 
-  if [[ -z "$tag" && $drive_full -eq 0 ]]; then
+  if [[ -z "$tag" && $cartridge_in_drive -eq 0 ]]; then
     local next
     if ! next="$(find_next_tape_slot)"; then
       err "No available non-cleaning data tapes found in slots $SLOT_FIRST-$SLOT_LAST."
@@ -730,14 +837,33 @@ ensure_tape_ready() {
     fi
     local slot="${next%%:*}"
     local ntag="${next##*:}"
-    load_tape_from_slot "$slot"
+    # Check load and mount explicitly: this function runs inside $(...) in
+    # the copy loop, where errexit is not relied upon, and a pre-existing
+    # mountpoint must not mask a failed load.
+    if ! load_tape_from_slot "$slot"; then
+      err "Failed to load tape from slot $slot into drive $TAPE_DRIVE."
+      RUN_COMPLETION_REASON="tape_load_failed"
+      exit 16
+    fi
+    if ! verify_loaded_tape_identity "$ntag" "$slot"; then
+      RUN_COMPLETION_REASON="loaded_tape_identity_mismatch"
+      exit 21
+    fi
     # mount if needed
-    mount_tape_filesystem
+    if ! mount_tape_filesystem; then
+      err "Failed to mount tape filesystem at $BACKUP_ROOT."
+      RUN_COMPLETION_REASON="mount_failed"
+      exit 3
+    fi
     ensure_mount
     tag="$ntag"
     LAST_KNOWN_TAPE_TAG="$tag"
   elif [[ "${SKIP_MOUNT_CHECK:-0}" != "1" ]] && ! mountpoint -q "$BACKUP_ROOT"; then
-    mount_tape_filesystem
+    if ! mount_tape_filesystem; then
+      err "Failed to mount tape filesystem at $BACKUP_ROOT."
+      RUN_COMPLETION_REASON="mount_failed"
+      exit 3
+    fi
   fi
   # If a tape is already loaded, still verify the mountpoint is valid
   ensure_mount
@@ -770,9 +896,19 @@ sync_tape_manifest_mirror() {
 
   mirror_path="$(manifest_mirror_path)"
   mkdir -p "$TAPE_MANIFEST_DIR"
-  cp -f "$TAPE_MANIFEST_ON_TAPE" "$mirror_path" || true
+  if ! cp -f "$TAPE_MANIFEST_ON_TAPE" "$mirror_path"; then
+    err "Could not refresh local manifest mirror: $mirror_path"
+    return 0
+  fi
   MANIFEST_MIRROR_DIRTY=0
-  MANIFEST_APPENDS_SINCE_SYNC=0
+}
+
+require_manifest_mirror() {
+  if [[ "$MANIFEST_MIRROR_DIRTY" == "1" ]]; then
+    err "Local tape manifest mirror is still out of date."
+    RUN_COMPLETION_REASON="manifest_mirror_failed"
+    exit 20
+  fi
 }
  
 # Rotate tape: mark current as full, unmount, unload, load next, mount
@@ -781,15 +917,24 @@ rotate_tape() {
   local curslot
   curslot="$(get_loaded_from_slot || true)"
  
-  log "Rotating tape. Marking current tape as FULL: $curtag"
-  tape_mark_full "$curtag"
- 
   log "Finalizing tape manifest for $curtag"
-  echo "# EndOfTape VolumeTag=$curtag Time=$(timestamp) Run=$RUN_ID" >> "$TAPE_MANIFEST_ON_TAPE" || true
+  if ! printf '# EndOfTape VolumeTag=%s Time=%s Run=%s\n' "$curtag" "$(timestamp)" "$RUN_ID" >> "$TAPE_MANIFEST_ON_TAPE"; then
+    err "Failed to append end-of-tape marker to $TAPE_MANIFEST_ON_TAPE; leaving cartridge loaded."
+    RUN_COMPLETION_REASON="manifest_finalize_failed"
+    exit 18
+  fi
   MANIFEST_MIRROR_DIRTY=1
   sync_tape_manifest_mirror
+  require_manifest_mirror
  
-  unmount_tape_filesystem || true
+  if ! unmount_tape_if_mounted; then
+    err "Failed to unmount $BACKUP_ROOT; refusing to unload tape $curtag."
+    RUN_COMPLETION_REASON="unmount_failed"
+    exit 17
+  fi
+
+  log "Rotating tape. Marking current tape as FULL: $curtag"
+  tape_mark_full "$curtag"
  
   # If we know the original slot, unload back to it; otherwise try the next empty slot strategy (not shown)
   if [[ -n "$curslot" ]]; then
@@ -809,9 +954,26 @@ rotate_tape() {
   local slot="${next%%:*}"
   local ntag="${next##*:}"
  
-  load_tape_from_slot "$slot"
-  mount_tape_filesystem
+  # Check load and mount explicitly (rotate_tape runs in the parent shell,
+  # so a bare failure would only exit with an unexplained code, no reason).
+  if ! load_tape_from_slot "$slot"; then
+    err "Failed to load next tape from slot $slot into drive $TAPE_DRIVE during rotation."
+    RUN_COMPLETION_REASON="tape_load_failed"
+    exit 16
+  fi
+  if ! verify_loaded_tape_identity "$ntag" "$slot"; then
+    RUN_COMPLETION_REASON="loaded_tape_identity_mismatch"
+    exit 21
+  fi
+  if ! mount_tape_filesystem; then
+    err "Failed to mount new tape filesystem at $BACKUP_ROOT during rotation."
+    RUN_COMPLETION_REASON="mount_failed"
+    exit 3
+  fi
   ensure_mount
+  # rotate_tape runs in the parent shell, so this persists across later
+  # ensure_tape_ready calls (useful when the new drive line lacks a tag).
+  LAST_KNOWN_TAPE_TAG="$ntag"
  
   # Start a new manifest on the new tape (new RUN_ID optional; keeping same RUN_ID is fine)
   TAPE_MANIFEST_ON_TAPE="$BACKUP_ROOT/.manifest_${RUN_ID}_${ntag}.txt"
@@ -819,6 +981,7 @@ rotate_tape() {
   record_manifest_path "$TAPE_MANIFEST_ON_TAPE"
   MANIFEST_MIRROR_DIRTY=1
   sync_tape_manifest_mirror
+  require_manifest_mirror
  
   log "Tape rotated. Now using VolumeTag=$ntag"
 }
@@ -850,19 +1013,38 @@ mark_ledger() {
     return 0
   fi
   mkdir -p "$(dirname "$LEDGER_FILE")"
-  { flock -x 9; echo "$rel" >> "$LEDGER_FILE"; } 9>>"$LEDGER_FILE"
+  {
+    flock -x 9 || exit 1
+    printf '%s\n' "$rel" >&9 || exit 1
+  } 9>>"$LEDGER_FILE" || return 1
   LEDGER_CACHE["$rel"]=1
 }
  
 append_to_tape_manifest() {
   local rel="$1"
   local mirror_path
+  local manifest_entry_key="$TAPE_MANIFEST_ON_TAPE|$rel"
 
-  echo "$rel" >> "$TAPE_MANIFEST_ON_TAPE"
+  if [[ -z "${MANIFEST_ENTRIES_WRITTEN[$manifest_entry_key]:-}" ]]; then
+    printf '%s\n' "$rel" >> "$TAPE_MANIFEST_ON_TAPE" || return 1
+    MANIFEST_ENTRIES_WRITTEN["$manifest_entry_key"]=1
+  fi
   if [[ "$DRY_RUN" != "1" ]]; then
     mirror_path="$(manifest_mirror_path)"
     mkdir -p "$TAPE_MANIFEST_DIR"
-    echo "$rel" >> "$mirror_path"
+    if [[ ! -f "$mirror_path" ]]; then
+      cp -f "$TAPE_MANIFEST_ON_TAPE" "$mirror_path" || {
+        err "Could not refresh local manifest mirror: $mirror_path"
+        MANIFEST_MIRROR_DIRTY=1
+        return 1
+      }
+    else
+      if ! printf '%s\n' "$rel" >> "$mirror_path"; then
+        err "Could not append to local manifest mirror: $mirror_path"
+        MANIFEST_MIRROR_DIRTY=1
+        return 1
+      fi
+    fi
   fi
 }
  
@@ -877,7 +1059,23 @@ catalog_add() {
   local vol="$1" idx="$2" bucket="$3" bytes="$4" dst="$5"
   local line
   line="$(date -Is),$RUN_ID,$vol,$idx,$bucket,$bytes,$dst"
-  { flock -x 8; echo "$line" >> "$CATALOG_FILE"; } 8>>"$CATALOG_FILE"
+  {
+    flock -x 8 || exit 1
+    if ! awk -F, -v volume="$vol" -v idx_name="$idx" -v bucket_name="$bucket" \
+      'NR > 1 && $3 == volume && $4 == idx_name && $5 == bucket_name { found = 1 } END { exit !found }' \
+      "$CATALOG_FILE"; then
+      printf '%s\n' "$line" >&8 || exit 1
+    fi
+  } 8>>"$CATALOG_FILE"
+}
+
+record_committed_bucket() {
+  local vol="$1" idx="$2" bucket="$3" bytes="$4" dst="$5"
+  local rel="$idx/$bucket"
+
+  append_to_tape_manifest "$rel" || return 1
+  catalog_add "$vol" "$idx" "$bucket" "$bytes" "$dst" || return 1
+  mark_ledger "$rel"
 }
  
 # --- Copy & Verify ---
@@ -977,9 +1175,35 @@ cleanup_stale_tmp_dirs() {
   fi
 }
  
+checksum_tree() {
+  local root="$1"
+  local files_file
+
+  (
+    cd -- "$root" || exit 1
+    files_file="$(mktemp "${TMPDIR:-/tmp}/splunk-tape-files.XXXXXX")" || exit 1
+    if ! find . -type f -print0 | LC_ALL=C sort -z > "$files_file"; then
+      rm -f -- "$files_file"
+      exit 1
+    fi
+    if [[ -s "$files_file" ]]; then
+      if have_cmd sha256sum; then
+        xargs -0 sha256sum < "$files_file"
+      else
+        xargs -0 shasum -a 256 < "$files_file"
+      fi
+      local checksum_status=$?
+      rm -f -- "$files_file"
+      exit "$checksum_status"
+    fi
+    rm -f -- "$files_file"
+  )
+}
+
 verify_copy() {
   local src_bytes="$1"
-  local dst="$2"
+  local src_bucket="$2"
+  local dst="$3"
   case "$VERIFY_METHOD" in
     size)
       # Compare total size of regular files only (avoids filesystem-dependent
@@ -990,6 +1214,30 @@ verify_copy() {
         err "Size mismatch: src=$src_bytes dst=$d"
         return 1
       fi
+      return 0
+      ;;
+    sha256)
+      local verify_dir
+      verify_dir="$(mktemp -d "${TMPDIR:-/tmp}/splunk-tape-verify.XXXXXX")" || {
+        err "Could not create temporary files for SHA-256 verification."
+        return 1
+      }
+      if ! checksum_tree "$src_bucket" > "$verify_dir/source"; then
+        err "Could not hash source bucket: $src_bucket"
+        rm -rf -- "$verify_dir"
+        return 1
+      fi
+      if ! checksum_tree "$dst" > "$verify_dir/tape"; then
+        err "Could not read back and hash copied bucket: $dst"
+        rm -rf -- "$verify_dir"
+        return 1
+      fi
+      if ! cmp -s -- "$verify_dir/source" "$verify_dir/tape"; then
+        err "SHA-256 verification failed: $src_bucket -> $dst"
+        rm -rf -- "$verify_dir"
+        return 1
+      fi
+      rm -rf -- "$verify_dir"
       return 0
       ;;
     none) return 0 ;;
@@ -1039,8 +1287,15 @@ copy_bucket_atomic() {
   fi
   # ---------------------------------------------------
  
-  if verify_copy "$src_bytes" "$tmp_dir"; then
-    mv -- "$tmp_dir" "$final_dst"
+  if verify_copy "$src_bytes" "$src_bucket" "$tmp_dir"; then
+    # Check the final rename explicitly: this function is called inside an
+    # `if`, where errexit is disabled, so a failed mv must not be treated
+    # as a successful commit (no success log, no ledger/catalog entry).
+    if ! mv -- "$tmp_dir" "$final_dst"; then
+      err "Final rename failed: $tmp_dir -> $final_dst (target path exists? not writable?). Cleaning up."
+      cleanup_tmp_dir "$tmp_dir" || true
+      return 1
+    fi
     log "Backed up: $src_bucket -> $final_dst"
   else
     err "Verification failed: $src_bucket (temp at $tmp_dir). Cleaning up."
@@ -1052,6 +1307,7 @@ copy_bucket_atomic() {
 main() {
   local run_started_epoch run_finished_epoch run_duration_seconds
   local run_started_ms run_finished_ms run_duration_ms
+  local final_exit_code=0
   local tape_tags_csv=""
   local tapes_touched_count=0
   TAPES_TOUCHED_MAP=()
@@ -1064,6 +1320,7 @@ main() {
  
   acquire_lock "$@"
   trap 'on_script_exit $?' EXIT
+  trap 'exit 143' TERM
   RUN_COMPLETION_REASON="completed"
   run_started_epoch="$(date +%s)"
   run_started_ms="$(epoch_ms_now)"
@@ -1090,12 +1347,14 @@ main() {
     init_catalog
     touch "$TAPES_FULL_LIST"
     current_tape_tag="$(ensure_tape_ready)"
+    sync_known_tape_tag "$current_tape_tag"
     record_tape_touched "$current_tape_tag"
     # Create or touch this run's manifest on the tape (after mount)
     : > "$TAPE_MANIFEST_ON_TAPE" || { err "Cannot write manifest on tape: $TAPE_MANIFEST_ON_TAPE"; RUN_COMPLETION_REASON="cannot_write_initial_manifest"; exit 4; }
     record_manifest_path "$TAPE_MANIFEST_ON_TAPE"
     MANIFEST_MIRROR_DIRTY=1
     sync_tape_manifest_mirror
+    require_manifest_mirror
     cleanup_stale_tmp_dirs
   fi
   load_ledger_cache
@@ -1110,62 +1369,116 @@ main() {
   fi
  
   local -a buckets
+  local -a skipped_active_samples=()
+  local -a pending_eligible_samples=()
+  local -a pending_active_samples=()
   local total=0 skipped=0 skipped_active=0 copied=0 failed=0
+  local pending_eligible=0 pending_active=0
   local current_bytes=0
- 
-  for idx in "${indexes[@]}"; do
-    local src_colddb="$SPLUNK_DB/$idx/colddb"
-    local dst_idx_dir="$BACKUP_ROOT/$idx"
-    mkdir -p "$dst_idx_dir/.tmp"
- 
-    log "--- Index: $idx ---"
- 
-    mapfile -t buckets < <(list_buckets_for_index "$idx")
-    if (( ${#buckets[@]} == 0 )); then
-      log "No matching buckets in $src_colddb"
-      continue
-    fi
- 
-    for b in "${buckets[@]}"; do
-      (( total++ )) || true
+  local pass_num=0 copied_before_pass=0 copied_this_pass=0
+
+  while :; do
+    (( pass_num++ )) || true
+    copied_before_pass=$copied
+    pending_eligible=0
+    pending_active=0
+    pending_eligible_samples=()
+    pending_active_samples=()
+
+    log "=== Copy pass $pass_num started ==="
+
+    for idx in "${indexes[@]}"; do
+      local src_colddb="$SPLUNK_DB/$idx/colddb"
+      local dst_idx_dir="$BACKUP_ROOT/$idx"
+      mkdir -p "$dst_idx_dir/.tmp"
+
+      log "--- Index: $idx ---"
+
+      mapfile -t buckets < <(list_buckets_for_index "$idx")
+      if (( ${#buckets[@]} == 0 )); then
+        log "No matching buckets in $src_colddb"
+        continue
+      fi
+
+      for b in "${buckets[@]}"; do
+        if (( pass_num == 1 )); then
+          (( total++ )) || true
+        fi
       local bucket_name
-      local bucket_bytes bucket_newest_mtime
       bucket_name=$(basename "$b")
       local rel="$idx/$bucket_name"
       local final_dst="$dst_idx_dir/$bucket_name"
 
-      read -r bucket_bytes bucket_newest_mtime < <(collect_bucket_metadata "$b")
- 
+      # Cheap checks before the metadata scan: the ledger lookup and the
+      # destination test are O(1), while collect_bucket_metadata() runs a
+      # recursive find over the whole bucket. Do not replace that find with
+      # a directory-mtime cache: nested file writes do not update the
+      # directory mtime, so such a cache would go stale.
       # Ledger-based dedupe across tapes/runs
       if already_in_ledger "$rel"; then
-        (( skipped++ )) || true
+        if (( pass_num == 1 )); then
+          (( skipped++ )) || true
+        fi
         log "Skip (ledger): $rel already archived"
         continue
       fi
  
       # If already present on the currently-mounted tape, also skip
       if [[ -d "$final_dst" ]]; then
-        (( skipped++ )) || true
+        if (( pass_num == 1 )); then
+          (( skipped++ )) || true
+        fi
         log "Skip (exists on tape): $final_dst"
-        # Also mark to ledger to avoid future copies if not yet recorded
         if [[ "$DRY_RUN" != "1" ]]; then
-          mark_ledger "$rel"
-          append_to_tape_manifest "$rel"
+          local existing_bytes existing_newest_mtime
+          read -r existing_bytes existing_newest_mtime < <(collect_bucket_metadata "$b")
+          if ! verify_copy "$existing_bytes" "$b" "$final_dst"; then
+            err "Existing tape bucket failed recovery verification: $final_dst"
+            ((failed++)) || true
+            if [[ "$STOP_ON_COPY_ERROR" == "1" ]]; then
+              RUN_COMPLETION_REASON="existing_bucket_verification_failed"
+              break 2
+            fi
+            continue
+          fi
+          if ! record_committed_bucket "$current_tape_tag" "$idx" "$bucket_name" "$existing_bytes" "$final_dst"; then
+            err "Could not repair catalog/manifest/ledger metadata for existing tape bucket: $final_dst"
+            ((failed++)) || true
+            if [[ "$STOP_ON_COPY_ERROR" == "1" ]]; then
+              RUN_COMPLETION_REASON="metadata_recovery_failed"
+              break 2
+            fi
+          fi
         fi
         continue
       fi
 
+      local bucket_bytes bucket_newest_mtime
+      read -r bucket_bytes bucket_newest_mtime < <(collect_bucket_metadata "$b")
+
       local skip_reason
       if skip_reason="$(bucket_skip_reason "$b" "$bucket_newest_mtime")"; then
-        (( skipped_active++ )) || true
+        if (( pass_num == 1 )); then
+          (( skipped_active++ )) || true
+          if (( ${#skipped_active_samples[@]} < 5 )); then
+            skipped_active_samples+=("$rel")
+          fi
+        fi
         log "Skip (active): $rel $skip_reason"
         continue
       fi
 
       if [[ "$DRY_RUN" != "1" ]]; then
-        # Make sure tape is loaded/mounted; refresh tag (in case of rotation)
-        current_tape_tag="$(ensure_tape_ready)"
-        record_tape_touched "$current_tape_tag"
+        # Cheap per-bucket liveness check: the tape filesystem must still be
+        # mounted (LTFS unmounts on media removal). `mtx status` is an
+        # expensive full library scan, so only redo it when the mount is
+        # gone, not for every bucket.
+        if [[ "${SKIP_MOUNT_CHECK:-0}" != "1" ]] && ! mountpoint -q "$BACKUP_ROOT"; then
+          log "Mountpoint $BACKUP_ROOT no longer mounted; re-checking tape state"
+          current_tape_tag="$(ensure_tape_ready)"
+          sync_known_tape_tag "$current_tape_tag"
+          record_tape_touched "$current_tape_tag"
+        fi
 
         local free_bytes
         free_bytes="$(tape_free_bytes)"
@@ -1175,6 +1488,7 @@ main() {
           log "Not enough space on tape VolumeTag=$current_tape_tag. Free=$(human_bytes "$free_bytes"), need=$(human_bytes "$bucket_bytes") + buffer=$(human_bytes "$MIN_FREE_BYTES"). Rotating..."
           rotate_tape "$current_tape_tag"
           current_tape_tag="$(ensure_tape_ready)"
+          sync_known_tape_tag "$current_tape_tag"
           record_tape_touched "$current_tape_tag"
         fi
 
@@ -1190,10 +1504,15 @@ main() {
       if copy_bucket_atomic "$b" "$dst_idx_dir" "$bucket_bytes"; then
         ((copied++)) || true
         if [[ "$DRY_RUN" != "1" ]]; then
-          mark_ledger "$rel"
-          append_to_tape_manifest "$rel"
-          catalog_add "$current_tape_tag" "$idx" "$bucket_name" "$bucket_bytes" "$final_dst"
           current_bytes=$(( current_bytes + bucket_bytes ))
+          if ! record_committed_bucket "$current_tape_tag" "$idx" "$bucket_name" "$bucket_bytes" "$final_dst"; then
+            err "Could not record catalog/manifest/ledger metadata for committed bucket: $final_dst"
+            ((failed++)) || true
+            if [[ "$STOP_ON_COPY_ERROR" == "1" ]]; then
+              RUN_COMPLETION_REASON="metadata_recording_failed"
+              break 2
+            fi
+          fi
         fi
       else
         ((failed++)) || true
@@ -1204,10 +1523,96 @@ main() {
           break 2
         fi
       fi
+      done
     done
+
+    # Post-pass sweep: detect buckets still pending after this pass.
+    for idx in "${indexes[@]}"; do
+      local dst_idx_dir="$BACKUP_ROOT/$idx"
+
+      mapfile -t buckets < <(list_buckets_for_index "$idx")
+      for b in "${buckets[@]}"; do
+        local bucket_name rel final_dst
+        local _bucket_bytes _bucket_newest_mtime
+        local pending_skip_reason
+
+        bucket_name=$(basename "$b")
+        rel="$idx/$bucket_name"
+        final_dst="$dst_idx_dir/$bucket_name"
+
+        if already_in_ledger "$rel"; then
+          continue
+        fi
+
+        if [[ -d "$final_dst" ]]; then
+          continue
+        fi
+
+        read -r _bucket_bytes _bucket_newest_mtime < <(collect_bucket_metadata "$b")
+        if pending_skip_reason="$(bucket_skip_reason "$b" "$_bucket_newest_mtime")"; then
+          (( pending_active++ )) || true
+          if (( ${#pending_active_samples[@]} < 5 )); then
+            pending_active_samples+=("$rel")
+          fi
+          continue
+        fi
+
+        (( pending_eligible++ )) || true
+        if (( ${#pending_eligible_samples[@]} < 5 )); then
+          pending_eligible_samples+=("$rel")
+        fi
+      done
+    done
+
+    copied_this_pass=$(( copied - copied_before_pass ))
+    log "=== Copy pass $pass_num done: copied_this_pass=$copied_this_pass pending_eligible=$pending_eligible pending_active=$pending_active ==="
+
+    if [[ "$RUN_COMPLETION_REASON" == "soft_limit_stop" || "$RUN_COMPLETION_REASON" == "copy_error_stop" ]]; then
+      break
+    fi
+
+    if [[ "$RUN_UNTIL_DRAINED" != "1" || "$DRY_RUN" == "1" ]]; then
+      if [[ "$DRY_RUN" == "1" ]]; then
+        # Dry runs never persist buckets, so draining would loop forever.
+        log "Dry run: single pass only; stopping drain loop"
+      fi
+      break
+    fi
+
+    if (( pending_eligible == 0 )); then
+      break
+    fi
+
+    if (( copied_this_pass == 0 )); then
+      if [[ "$DRY_RUN" == "1" ]]; then
+        log "Dry run: no copies performed; stopping after pass $pass_num"
+      else
+        RUN_COMPLETION_REASON="pending_eligible_no_progress"
+        log "Pending eligible buckets remain but no progress in pass $pass_num; stopping to avoid infinite loop."
+      fi
+      break
+    fi
+
+    if (( MAX_DRAIN_PASSES > 0 && pass_num >= MAX_DRAIN_PASSES )); then
+      RUN_COMPLETION_REASON="max_drain_passes_reached"
+      log "Reached MAX_DRAIN_PASSES=$MAX_DRAIN_PASSES with pending eligible buckets still present."
+      break
+    fi
   done
 
   sync_tape_manifest_mirror
+
+  if [[ "$MANIFEST_MIRROR_DIRTY" == "1" ]]; then
+    err "Local tape manifest mirror is still out of date."
+    RUN_COMPLETION_REASON="manifest_mirror_failed"
+    final_exit_code=20
+  fi
+
+  if ! unmount_tape_if_mounted; then
+    err "Failed to unmount tape filesystem at $BACKUP_ROOT after copying."
+    RUN_COMPLETION_REASON="unmount_failed"
+    final_exit_code=17
+  fi
 
   run_finished_epoch="$(date +%s)"
   run_finished_ms="$(epoch_ms_now)"
@@ -1229,6 +1634,37 @@ main() {
   log "Skipped due to recent roll or activity: $skipped_active"
   log "Copied this run: $copied"
   log "Failed: $failed"
+
+  if [[ "$RUN_COMPLETION_REASON" == "completed" ]] && (( skipped_active > 0 )); then
+    RUN_COMPLETION_REASON="completed_with_active_deferred_buckets"
+  fi
+
+  if [[ "$RUN_COMPLETION_REASON" == "completed" ]] && (( pending_eligible > 0 )); then
+    RUN_COMPLETION_REASON="completed_with_pending_eligible_buckets"
+  fi
+
+  if (( skipped_active > 0 )); then
+    log "Note: $skipped_active bucket(s) were deferred by activity guards (BUCKET_MIN_DIR_AGE_SECONDS=$BUCKET_MIN_DIR_AGE_SECONDS, BUCKET_MIN_QUIET_SECONDS=$BUCKET_MIN_QUIET_SECONDS)."
+    if (( ${#skipped_active_samples[@]} > 0 )); then
+      log "Deferred bucket examples: ${skipped_active_samples[*]}"
+    fi
+    log "Set BUCKET_MIN_DIR_AGE_SECONDS=0 and BUCKET_MIN_QUIET_SECONDS=0 to copy all eligible colddb buckets immediately."
+  fi
+
+  if (( pending_eligible > 0 )); then
+    log "Post-run sweep: $pending_eligible eligible bucket(s) remain uncopied after this pass."
+    if (( ${#pending_eligible_samples[@]} > 0 )); then
+      log "Pending eligible bucket examples: ${pending_eligible_samples[*]}"
+    fi
+  fi
+
+  if (( pending_active > 0 )); then
+    log "Post-run sweep: $pending_active additional bucket(s) currently deferred by activity guards."
+    if (( ${#pending_active_samples[@]} > 0 )); then
+      log "Pending active bucket examples: ${pending_active_samples[*]}"
+    fi
+  fi
+
   if (( SOFT_LIMIT_BYTES > 0 )); then
     log "Bytes written this run (approx): $(human_bytes "$current_bytes") / $(human_bytes "$SOFT_LIMIT_BYTES")"
   fi
@@ -1242,7 +1678,7 @@ main() {
     log "Run manifest written to: $TAPE_MANIFEST_ON_TAPE"
     log "Local manifest mirror: $TAPE_MANIFEST_DIR/$(basename "$TAPE_MANIFEST_ON_TAPE")"
   fi
-  if (( failed == 0 )); then
+  if (( failed == 0 && final_exit_code == 0 )); then
     append_splunk_summary "success" "$current_tape_tag" "$tape_tags_csv" "${#indexes[@]}" "$total" "$skipped" "$skipped_active" "$copied" "$failed" "$current_bytes" "$run_duration_seconds" "$run_duration_ms" "$RUN_COMPLETION_REASON" "$tapes_touched_count"
   else
     append_splunk_summary "failed" "$current_tape_tag" "$tape_tags_csv" "${#indexes[@]}" "$total" "$skipped" "$skipped_active" "$copied" "$failed" "$current_bytes" "$run_duration_seconds" "$run_duration_ms" "$RUN_COMPLETION_REASON" "$tapes_touched_count"
@@ -1250,6 +1686,15 @@ main() {
   log "Structured run events appended to main log: $LOG_FILE"
   log "Ledger file: $LEDGER_FILE"
   log "=== Done ==="
+
+  if (( final_exit_code != 0 )); then
+    exit "$final_exit_code"
+  fi
+
+  if [[ "$STRICT_COMPLETION" == "1" ]] && (( pending_eligible > 0 )); then
+    err "STRICT_COMPLETION=1 and pending eligible buckets remain ($pending_eligible). Failing run."
+    exit 6
+  fi
  
   (( failed == 0 )) || exit 2
 }

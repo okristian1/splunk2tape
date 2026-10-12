@@ -6,6 +6,14 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+# Tape writes and LTFS metadata updates must not be interrupted by an
+# automatic service timeout. A wedged run requires operator intervention.
+TimeoutStartSec=infinity
+# The script is systemd's MainPID and handles TERM by unmounting LTFS first.
+# Do not SIGKILL a hung LTFS process; investigate and recover the tape manually.
+KillMode=mixed
+TimeoutStopSec=infinity
+SendSIGKILL=no
 # Optional environment overrides, for example:
 # LOG_LEVEL=info
 # DRY_RUN=0

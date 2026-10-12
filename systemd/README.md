@@ -48,6 +48,14 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now splunk-tape-backup.timer
 ```
 
+The service intentionally has no automatic start/stop timeout and disables
+`SIGKILL` escalation. This prevents systemd from forcibly terminating LTFS
+while it may be updating tape metadata. A hung service requires investigation
+and manual recovery; do not force-kill it while a tape is mounted.
+
+After changing either unit file, copy it into `/etc/systemd/system/` and run
+`sudo systemctl daemon-reload` before the next run.
+
 ## 5) Verify schedule and run manually
 
 ```bash

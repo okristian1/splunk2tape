@@ -8,8 +8,8 @@
 
 ## Key operational knobs (env vars)
 - `SPLUNK_DB` defaults to `/archdisk/splunk_db`; `BACKUP_ROOT` controls the tape mount path.
-- `MOUNT_CMD` / `UMOUNT_CMD` override tape filesystem mount handling. By default the script mounts with `ltfs` using `LTFS_DEVNAME` and unmounts with `umount`, so tape rotation works without extra exports in common LTFS setups.
-- `VERIFY_METHOD=size|none` controls integrity checks (size compares total regular-file bytes via `stat`).
+- `MOUNT_CMD` / `UMOUNT_CMD` override tape filesystem mount handling. The script unmounts before rotation and exit; a failed unmount must never be followed by `mtx unload`.
+- `VERIFY_METHOD=sha256|size|none` controls integrity checks. SHA-256 is the default and reads copied file contents through LTFS; `size` is faster but only checks byte totals.
 - `MIN_FREE_BYTES` and `SOFT_LIMIT_BYTES` control tape capacity behavior.
 - `CPU_NICE_LEVEL`, `IO_NICE_CLASS`, `IO_NICE_LEVEL` lower process priority to protect a busy Splunk indexer.
 - `SKIP_MOUNT_CHECK=1` bypasses the `mountpoint -q` check (for testing on plain directories).
@@ -31,12 +31,17 @@
 - Index discovery and bucket selection: `discover_indexes()` and `list_buckets_for_index()`.
 
 ## Testing without tape hardware
-- `tools/test-run.sh` is a self-contained harness: creates fake Splunk indexes, mounts a tmpfs, wires the mock `mtx`, and runs the backup end-to-end.
-- `tools/mtx-mock.sh` simulates an HPE MSL3040 changer (40 slots, WA0001L9–WA0040L9). State persists in `/tmp/mtx-mock.state`.
+- `tools/test-run.sh` is a self-contained harness: creates fake Splunk indexes, mounts a tmpfs, wires the mock `mtx`, and runs the backup end-to-end. Needs root (bind mounts).
+- `tools/smoke-test.sh` is a non-root, non-hardware test: same mocks plus `SKIP_MOUNT_CHECK=1` and marker-backed mount commands; it covers SHA-256 corruption, identity rejection, unmount failure, metadata recovery, rotation, and prior failure paths. GNU-isms are shimmed only when the system lacks them.
+- `systemd/splunk-tape-backup.service` uses the script shell as MainPID, `KillMode=mixed`, and no automatic timeout/SIGKILL escalation so Bash can cleanly unmount LTFS.
+- `tools/mtx-mock.sh` simulates an HPE MSL3040 changer (40 slots, WA0001L9–WA0040L9). State persists in `/tmp/mtx-mock.state`. Opt-in test hooks: `MTX_MOCK_FAIL_LOAD=all|<slot>`, `MTX_MOCK_OMIT_DRIVE_TAG=1`.
 - Usage: `bash tools/test-run.sh` (full run), `--dry` (simulate), `--clean` (remove artifacts).
 - The harness sets `MIN_FREE_BYTES=0` and uses tmpfs so `mountpoint -q` passes without `SKIP_MOUNT_CHECK`.
 
 ## Bash pitfalls to watch for
 - `set -Eeuo pipefail` is active; `(( var++ ))` returns exit code 1 when var=0 — always append `|| true`.
-- `log()` writes to stderr so that `$(func)` subshell captures are not polluted.
+- A function called inside an `if` condition runs with errexit disabled, even with `set -E`: always check commands whose failure matters (the final `mv`, `mtx load`, mount) explicitly and return a specific exit code/reason.
+- `log()` writes to stderr so that `$(func)` subshell captures are not polluted; `mtx load` output is redirected to stderr the same way because its progress goes to stdout and would otherwise contaminate the captured VolumeTag.
+- `LAST_KNOWN_TAPE_TAG` set inside `$(ensure_tape_ready)` does not persist to the parent shell; `sync_known_tape_tag()` in the parent keeps it current.
 - `verify_copy()` uses `find -type f | stat --format='%s'` (not `du -sb`) to avoid directory-entry size differences across filesystems.
+- mtx reports a present cartridge as `Full` (occupied), not "capacity exhausted"; do not read more into that word than presence.

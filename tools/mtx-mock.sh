@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Mock mtx for testing without a tape library (RHEL 9 VM).
 # Keeps state in /tmp/mtx-mock.state
+# Test hooks (opt-in env vars, all default to no-op):
+#   MTX_MOCK_FAIL_LOAD=all|<slot>   make load fail for given slot(s)
+#   MTX_MOCK_OMIT_DRIVE_TAG=1       drive status line without :VolumeTag=
+#   MTX_MOCK_LOAD_TAG_OVERRIDE=<tag> report an unexpected tag after load
 set -euo pipefail
 
 STATE_FILE="${MTX_MOCK_STATE:-/tmp/mtx-mock.state}"
@@ -66,7 +70,14 @@ status_cmd() {
     if [[ "${DRIVE_KIND:-data}" == "cleaning" ]]; then
       echo "Data Transfer Element $TAPE_DRIVE:Full (Storage Element ${DRIVE_SLOT} Loaded):Cleaning Cartridge"
     else
-      echo "Data Transfer Element $TAPE_DRIVE:Full (Storage Element ${DRIVE_SLOT} Loaded):VolumeTag=${DRIVE_TAG}"
+      local drive_line="Data Transfer Element $TAPE_DRIVE:Full (Storage Element ${DRIVE_SLOT} Loaded)"
+      # Some real mtx builds do not include the VolumeTag on the drive line;
+      # MTX_MOCK_OMIT_DRIVE_TAG=1 emulates that to test the last-known-tag
+      # fallback path in ensure_tape_ready.
+      if [[ "${MTX_MOCK_OMIT_DRIVE_TAG:-0}" != "1" && -n "${DRIVE_TAG:-}" ]]; then
+        drive_line="${drive_line}:VolumeTag=${DRIVE_TAG}"
+      fi
+      echo "$drive_line"
     fi
   else
     echo "Data Transfer Element $TAPE_DRIVE:Empty"
@@ -89,6 +100,13 @@ status_cmd() {
 
 load_cmd() {
   local slot="$1"
+  # MTX_MOCK_FAIL_LOAD=all|<slot> forces a load failure before any state
+  # change, to test the script's load-failure handling.
+  local fail_load="${MTX_MOCK_FAIL_LOAD:-}"
+  if [[ -n "$fail_load" && ( "$fail_load" == "all" || "$fail_load" == "$slot" ) ]]; then
+    echo "Drive $TAPE_DRIVE: load of storage $slot failed (mock)" >&2
+    exit 1
+  fi
   if [[ "$DRIVE_LOADED" == "1" ]]; then
     echo "Drive already loaded" >&2
     exit 1
@@ -100,6 +118,11 @@ load_cmd() {
     echo "Slot $slot is empty" >&2
     exit 1
   fi
+  # Real mtx prints load progress to stdout; emit it (faithfully) so tests
+  # can verify the backup script keeps stdout clean for its captured tag.
+  echo "At storage $slot"
+  echo "Moving to position 100"
+  echo "Storage $slot loaded"
   DRIVE_LOADED=1
   DRIVE_SLOT="$slot"
   if slot_is_cleaning "$slot"; then
@@ -107,7 +130,7 @@ load_cmd() {
     DRIVE_TAG=""
   else
     DRIVE_KIND="data"
-    DRIVE_TAG="${!key_tag}"
+    DRIVE_TAG="${MTX_MOCK_LOAD_TAG_OVERRIDE:-${!key_tag}}"
   fi
   eval "$key_full=0"
   eval "$key_tag="

@@ -1,0 +1,9 @@
+# This is a bash-only repo; ignore accidental tooling artifacts
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Local runtime state (never commit)
+*.log
